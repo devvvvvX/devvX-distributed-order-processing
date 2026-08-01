@@ -1,0 +1,89 @@
+# ============================================================
+# Phase 1 — Docker Compose: Monolith + PostgreSQL
+# ============================================================
+# 🔍 LEARNING NOTE: In Phase 1, we only have two services: the app and PostgreSQL.
+# No Kafka, no Redis — we haven't earned those yet.
+# Notice how simple this is. Cherish this simplicity.
+# By Phase 3, this file will have 8+ services.
+
+services:
+  # ─────────────────────────────────────────────────
+  # PostgreSQL — Our single source of truth
+  # ─────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: op-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: orderplatform
+      POSTGRES_PASSWORD: orderplatform_dev
+      POSTGRES_DB: order_platform
+    volumes:
+      # Persist data across container restarts
+      - postgres_data:/var/lib/postgresql/data
+
+      # Auto-run schema on first start
+      # 🔍 LEARNING NOTE: Files in /docker-entrypoint-initdb.d/ run only on
+      # first initialization (when data volume is empty). If you change the
+      # schema, you need to either:
+      #   1. docker compose down -v (deletes data!)
+      #   2. Run ALTER TABLE migrations manually
+      # In production, you'd use a migration tool (Flyway, knex migrations, etc.)
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orderplatform -d order_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ─────────────────────────────────────────────────
+  # Application — The Monolith
+  # ─────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: op-app
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      HOST: 0.0.0.0
+
+      # 🔍 LEARNING NOTE: Inside Docker network, services reference each other
+      # by service name (postgres), not localhost. Docker Compose creates a
+      # shared network where service names resolve via internal DNS.
+
+      DATABASE_URL: postgresql://orderplatform:orderplatform_dev@postgres:5432/order_platform
+      DB_POOL_MIN: 2
+      DB_POOL_MAX: 10
+      LOG_LEVEL: debug
+      NOTIFICATION_DELAY_MS: 500
+      NOTIFICATION_FAILURE_RATE: 0.0
+      SHUTDOWN_TIMEOUT_MS: 10000
+
+    depends_on:
+      postgres:
+        # 🔍 LEARNING NOTE: "service_healthy" means Docker waits until
+        # PostgreSQL's healthcheck passes before starting the app.
+        # Without this, the app might start before the DB is ready,
+        # causing connection errors on startup.
+        condition: service_healthy
+
+    # 🔍 LEARNING NOTE: In dev, we mount source code so tsx watch picks up changes.
+    # In production, you'd never mount source code — the image contains everything.
+    volumes:
+      - ./src:/app/src
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  postgres_data:
+    driver: local
