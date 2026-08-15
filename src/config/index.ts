@@ -30,6 +30,15 @@ const configSchema = z.object({
     notificationDelayMs: z.coerce.number().int().min(0).default(500),
     notificationFailureRate: z.coerce.number().min(0).max(1).default(0),
 
+    // Kafka
+    // 🔍 LEARNING NOTE: Kafka config is optional — the Order API can
+    // function without Kafka (events just won't be published). This
+    // lets us develop and test the HTTP layer independently.
+    kafkaBrokers: z.string().default(''), // comma-separated, e.g. "kafka:9092"
+    kafkaClientId: z.string().default('order-platform'),
+    kafkaConsumerGroupId: z.string().default('notification-service'),
+    kafkaTopicOrderEvents: z.string().default('order-events'),
+
     // Graceful Shutdown
     shutdownTimeoutMs: z.coerce.number().int().positive().default(10000),
 });
@@ -49,11 +58,15 @@ function loadConfig(): Config {
         logLevel: process.env['LOG_LEVEL'],
         notificationDelayMs: process.env['NOTIFICATION_DELAY_MS'],
         notificationFailureRate: process.env['NOTIFICATION_FAILURE_RATE'],
+        kafkaBrokers: process.env['KAFKA_BROKERS'],
+        kafkaClientId: process.env['KAFKA_CLIENT_ID'],
+        kafkaConsumerGroupId: process.env['KAFKA_CONSUMER_GROUP_ID'],
+        kafkaTopicOrderEvents: process.env['KAFKA_TOPIC_ORDER_EVENTS'],
         shutdownTimeoutMs: process.env['SHUTDOWN_TIMEOUT_MS'],
     });
 
     // Fail LOUD and CLEAR at startup
-    if (!result.success){
+    if (!result.success) {
         console.error('❌ Invalid configuration');
         console.error(z.treeifyError(result.error));
         process.exit(1);

@@ -22,14 +22,16 @@ import { OrderStatusType } from "./order.types";
 import { createModuleLogger } from "../../shared/logger";
 import { ApiError, ApiResponse } from "../../types/index.js";
 import { Order, OrderStatusHistoryEntry } from "../orders/order.types.js";
+import { EventProducer } from "../../kafka/producer.js";
 
 const log = createModuleLogger("order-routes");
 
 export async function registerOrderRoutes(
   app: FastifyInstance,
   pool: Pool,
+  eventProducer: EventProducer | null = null,
 ): Promise<void> {
-  const orderService = new OrderService(pool);
+  const orderService = new OrderService(pool, eventProducer);
 
   // ─────────────────────────────────────────────────
   // POST /api/v1/orders — Create Order
@@ -218,8 +220,8 @@ export async function registerOrderRoutes(
       const { id } = request.params;
       const reason =
         request.body &&
-        typeof request.body === "object" &&
-        "reason" in request.body
+          typeof request.body === "object" &&
+          "reason" in request.body
           ? (request.body as { reason?: string }).reason
           : undefined;
 

@@ -1,20 +1,24 @@
 // ============================================================
-// Order Service — Business Logic
+// Order Service — Business Logic (Phase 2: Event-Driven)
 // ============================================================
 // The service layer is where business logic lives.
 // It orchestrates between:
 //   - Repository (data access)
-//   - Notification service (side effects)
+//   - Event producer (kafka - async side effects)
 //   - Validation rules (state machine)
 //
-// It should NOT:
-//   - Know about HTTP (no request/response objects)
-//   - Contain SQL queries (that's the repository's job)
-//   - Contain framework-specific code
+// 🔍 PHASE 2 EVOLUTION:
+// In Phase 1, this service called NotificationService.send() SYNCHRONOUSLY
+// during order creation. That added 500ms to every order API call.
 //
-// This separation makes the service testable and portable.
-// When we extract this into a microservice (Phase 2+), the
-// service logic stays exactly the same
+// In Phase 2, we replaced that with EventProducer.publishOrderCreated(),
+// which publishes an event to Kafka in ~2ms. The notification is now
+// processed asynchronously by a separate consumer process.
+//
+// The service layer itself barely changed — we swapped one dependency
+// for another. This is the benefit of clean architecture: business logic
+// (validation, state machine, idempotency) stays identical. Only the
+// "how do we trigger side effects?" part changed.
 
 import { Pool } from "pg";
 import { OrderRepository } from "./order.repository";
@@ -26,8 +30,7 @@ import {
   VALID_STATUS_TRANSITIONS,
   OrderStatusType,
 } from "./order.types.js";
-import { NotificationService } from "../notifications/notification.service.js";
-import { NotificationRepository } from "../notifications/notification.repository.js";
+import { EventProducer } from "../../kafka/producer.js";
 import { NotFoundError, ConflictError } from "../../shared/errors.js";
 import { createModuleLogger } from "../../shared/logger.js";
 
@@ -35,13 +38,17 @@ const log = createModuleLogger("order-service");
 
 export class OrderService {
   private readonly orderRepo: OrderRepository;
-  private readonly notificationService: NotificationService;
 
-  constructor(pool: Pool) {
+  // 🔍 LEARNING NOTE: EventProducer is optional (nullable).
+  // If Kafka is not configured (e.g., in tests or dev without Kafka),
+  // the service still works — it just doesn't publish events.
+  // This is graceful degradation: the core function (order CRUD) works
+  // even if the event bus is unavailable.
+  private readonly eventProducer: EventProducer | null;
+
+  constructor(pool: Pool, eventProducer: EventProducer | null = null) {
     this.orderRepo = new OrderRepository(pool);
-
-    const notificationRepo = new NotificationRepository(pool);
-    this.notificationService = new NotificationService(notificationRepo);
+    this.eventProducer = eventProducer;
   }
 
   // ─────────────────────────────────────────────────
@@ -149,51 +156,50 @@ export class OrderService {
       "📦 Order created",
     );
 
-    // Step 4: Send notification (SYNCHRONOUS — the bottleneck!)
-    // 🔍 LEARNING NOTE: This is where the monolith hurts.
-    // The order is already in the database, but we're about to
-    // block the HTTP response to send a notification.
+    // Step 4: Publish event (ASYNCHRONOUS - ~2ms, non-blocking!)
     //
-    // Measuring the impact:
-    //   DB write: ~5-20ms
-    //   Notification: ~500ms (configurable via NOTIFICATION_DELAY_MS)
-    //   Total: ~520ms instead of ~20ms
+    // ═══════════════════════════════════════════════════════════════
+    // 🔍 PHASE 2 CHANGE: This is THE key architectural change.
     //
-    // The customer is staring at a loading spinner for 500ms
-    // because we're sending an email they won't read for 10 minutes.
-
-    try {
-      const { subject, content } =
-        this.notificationService.buildOrderConfirmationContent({
-          id: order.id,
-          customerName: order.customerName,
-          restaurantName: order.restaurantName,
-          grandTotal: order.grandTotal,
-        });
-
-      await this.notificationService.send({
-        orderId: order.id,
-        type: "ORDER_CONFIRMED",
-        channel: "EMAIL",
-        recipient: order.customerEmail,
-        subject,
-        content,
+    // BEFORE (Phase 1 — synchronous):
+    //   await this.notificationService.send({ ... });
+    //   // Blocks for 500ms. Customer waits. Bad UX.
+    //
+    // AFTER (Phase 2 — event-driven):
+    //   await this.eventProducer.publishOrderCreated(order);
+    //   // Returns in ~2ms. Customer gets fast response. 🎉
+    //
+    // The notification is now processed ASYNCHRONOUSLY by the
+    // notification consumer (src/consumers/notification-consumer.ts).
+    //
+    // What happens if Kafka is down?
+    //   - The event is NOT published (logged as error)
+    //   - The order is still saved in the DB (customer's order is safe)
+    //   - The notification won't be sent (acceptable trade-off)
+    //   - In Phase 3, the Transactional Outbox pattern eliminates this gap
+    // ═══════════════════════════════════════════════════════════════
+    if (this.eventProducer) {
+      await this.eventProducer.publishOrderCreated({
+        id: order.id,
+        customerId: order.customerId,
+        customerName: order.customerName,
+        customerEmail: order.customerEmail,
+        customerPhone: order.customerPhone,
+        restaurantId: order.restaurantId,
+        restaurantName: order.restaurantName,
+        status: order.status,
+        totalAmount: order.totalAmount,
+        deliveryFee: order.deliveryFee,
+        taxAmount: order.taxAmount,
+        grandTotal: order.grandTotal,
+        deliveryAddress: order.deliveryAddress,
+        items: order.items.map((item) => ({
+          itemName: item.itemName,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice,
+          totalPrice: item.totalPrice,
+        })),
       });
-    } catch (err) {
-      // 🔍 LEARNING NOTE: We catch and log, but still return the order.
-      // This is a pragmatic compromise: the order was saved successfully,
-      // so we shouldn't fail the API call just because email is down.
-      //
-      // BUT: the customer won't get a notification. There's no retry mechanism.
-      // The notification is just lost. In Phase 2, Kafka ensures notifications
-      // are reliably processed even if the notification service is temporarily down.
-      log.error(
-        {
-          err,
-          orderId: order.id,
-        },
-        "⚠️  Notificaiton failed but order was created successfully",
-      );
     }
 
     const totalLatency = Date.now() - startTime;
@@ -268,7 +274,7 @@ export class OrderService {
     if (!allowedTransitions?.includes(input.status)) {
       throw new ConflictError(
         `Cannot transition from ${currentOrder.status} to ${input.status}. ` +
-          `Allowed transitions: ${allowedTransitions?.join(", ") || "none (terminal state)"}`,
+        `Allowed transitions: ${allowedTransitions?.join(", ") || "none (terminal state)"}`,
         "INVALID_STATUS_TRANSITION",
       );
     }
@@ -303,34 +309,19 @@ export class OrderService {
       `📋 Order status updated: ${currentOrder.status} → ${input.status}`,
     );
 
-    // Step 4: Send status update notification (SYNCHRONOUS - again, the bottleneck)
-    try {
-      const { subject, content } =
-        this.notificationService.buildOrderUpdateContent({
-          id,
-          customerName: updatedOrder.customerName,
-          status: updatedOrder.status,
-        });
-
-      await this.notificationService.send({
+    // Step 4: Publish status change event (ASYNCHRONOUS)
+    // 🔍 PHASE 2 CHANGE: Same pattern as createOrder — publish event
+    // instead of calling notification service synchronously.
+    if (this.eventProducer) {
+      await this.eventProducer.publishOrderStatusChanged({
         orderId: updatedOrder.id,
-        type:
-          updatedOrder.status === "CANCELLED"
-            ? "ORDER_CANCELLED"
-            : "ORDER_CONFIRMED",
-        channel: "EMAIL",
-        recipient: updatedOrder.customerEmail,
-        subject,
-        content,
+        previousStatus: currentOrder.status,
+        newStatus: updatedOrder.status,
+        changedBy: input.changedBy ?? 'system',
+        customerEmail: updatedOrder.customerEmail,
+        customerName: updatedOrder.customerName,
+        restaurantName: updatedOrder.restaurantName
       });
-    } catch (err) {
-      log.error(
-        {
-          err,
-          orderId: id,
-        },
-        "⚠️  Status notification failed but status was updated",
-      );
     }
     return updatedOrder;
   }
@@ -349,10 +340,10 @@ export class OrderService {
   // ─────────────────────────────────────────────────
   // GET STATUS HISTORY
   // ─────────────────────────────────────────────────
-  async getOrderStatusHistory(orderId: string) : Promise<OrderStatusHistoryEntry []> {
+  async getOrderStatusHistory(orderId: string): Promise<OrderStatusHistoryEntry[]> {
     // Verify order status
     const order = await this.orderRepo.findById(orderId);
-    if(!order){
+    if (!order) {
       throw new NotFoundError('Order', orderId);
     }
 

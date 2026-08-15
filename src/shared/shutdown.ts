@@ -28,12 +28,13 @@
 // LESS than terminationGracePeriodSeconds.
 import { FastifyInstance } from "fastify";
 import { Pool } from "pg";
-import { createModuleLogger } from "./logger";
+import { createModuleLogger } from "./logger.js";
 import { config } from "../config";
+import { EventProducer } from "../kafka/producer.js";
 
 const log = createModuleLogger("shutdown");
 
-export function setupGracefulShutdown(app: FastifyInstance, pool: Pool): void {
+export function setupGracefulShutdown(app: FastifyInstance, pool: Pool, eventProducer: EventProducer | null = null): void {
   let isShuttingDown = false;
 
   async function shutdown(signal: string): Promise<void> {
@@ -67,19 +68,22 @@ export function setupGracefulShutdown(app: FastifyInstance, pool: Pool): void {
       await app.close();
       log.info("✅ HTTP server closed");
 
-      // Step 2: Close database pool
-      // This waits for active queries to finish, then close connections
+      // Step 2: Disconnect Kafka producer (flush pending events)
+      // 🔍 LEARNING NOTE: The producer's disconnect() flushes its
+      // internal buffer, ensuring no events are lost. This must happen
+      // BEFORE closing the DB pool because the producer might still
+      // be serializing events that reference DB data.
+      if (eventProducer) {
+        log.info('Disconnecting Kafka producer...');
+        await eventProducer.disconnect();
+        log.info('✅ Kafka producer disconnected');
+      }
+
+      // Step 3: Close database pool
+      // This waits for active queries to finish, then closes connections.
       log.info("Closing database pool...");
       await pool.end();
       log.info("✅ Database pool closed");
-
-      // 🔍 LEARNING NOTE: In Phase 2+, we'll also need to:
-      // - Disconnect Kafka producers (flush pending messages first!)
-      // - Disconnect Kafka consumers (commit offsets first!)
-      // - Close Redis connections
-      // - Close SSE connections
-      // Each of these has its own shutdown ordering requirements.
-      // Getting the order wrong causes data loss or duplicate processing.
 
       log.info("✅ Graceful shutdown complete");
       process.exit(0);

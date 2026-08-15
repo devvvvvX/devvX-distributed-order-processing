@@ -25,8 +25,9 @@ import { registerOrderRoutes } from "./modules/orders/order.routes.js";
 import { registerHealthRoutes } from "./shared/health.js";
 import { AppError } from "./shared/errors.js";
 import { ApiResponse } from "./types/index.js";
+import { EventProducer } from "./kafka/producer.js";
 
-export async function buildServer(pool: Pool): Promise<FastifyInstance> {
+export async function buildServer(pool: Pool, eventProducer: EventProducer | null = null): Promise<FastifyInstance> {
   // 🔍 LEARNING NOTE: In Fastify v5, the `logger` option only accepts a
   // plain config object — you cannot pass a Pino instance directly.
   // If you need a shared Pino instance elsewhere (e.g. for DB or queue
@@ -39,34 +40,34 @@ export async function buildServer(pool: Pool): Promise<FastifyInstance> {
   const app = Fastify({
     logger: isDev
       ? {
-          level: config.logLevel,
-          base: { service: "order-platform", version: "1.0.0" },
-          redact: {
-            paths: ["req.headers.authorization", "req.headers.cookie"],
-            censor: "[REDACTED]",
-          },
+        level: config.logLevel,
+        base: { service: "order-platform", version: "1.0.0" },
+        redact: {
+          paths: ["req.headers.authorization", "req.headers.cookie"],
+          censor: "[REDACTED]",
+        },
 
-          // Pretty-print in dev — raw JSON in production.
-          // 🔍 LEARNING NOTE: Production log pipelines (Datadog, CloudWatch,
-          // ELK) ingest raw JSON and do formatting themselves. Pretty-printing
-          // in prod wastes CPU and produces unstructured output.
-          transport: {
-            target: "pino-pretty",
-            options: {
-              colorize: true,
-              translateTime: "SYS:HH:MM:ss.l",
-              ignore: "pid,hostname",
-            },
-          },
-        }
-      : {
-          level: config.logLevel,
-          base: { service: "order-platform", version: "1.0.0" },
-          redact: {
-            paths: ["req.headers.authorization", "req.headers.cookie"],
-            censor: "[REDACTED]",
+        // Pretty-print in dev — raw JSON in production.
+        // 🔍 LEARNING NOTE: Production log pipelines (Datadog, CloudWatch,
+        // ELK) ingest raw JSON and do formatting themselves. Pretty-printing
+        // in prod wastes CPU and produces unstructured output.
+        transport: {
+          target: "pino-pretty",
+          options: {
+            colorize: true,
+            translateTime: "SYS:HH:MM:ss.l",
+            ignore: "pid,hostname",
           },
         },
+      }
+      : {
+        level: config.logLevel,
+        base: { service: "order-platform", version: "1.0.0" },
+        redact: {
+          paths: ["req.headers.authorization", "req.headers.cookie"],
+          censor: "[REDACTED]",
+        },
+      },
 
     // 🔍 LEARNING NOTE: Every request gets a unique ID.
     // This ID is included in ALL log lines for that request.
@@ -190,7 +191,7 @@ export async function buildServer(pool: Pool): Promise<FastifyInstance> {
   // ─────────────────────────────────────────────────
 
   await registerHealthRoutes(app, pool);
-  await registerOrderRoutes(app, pool);
+  await registerOrderRoutes(app, pool, eventProducer);
 
   return app;
 }

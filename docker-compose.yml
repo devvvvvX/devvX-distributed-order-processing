@@ -1,10 +1,15 @@
 # ============================================================
-# Phase 1 — Docker Compose: Monolith + PostgreSQL
+# Phase 2 — Docker Compose: Event-Driven Architecture
 # ============================================================
-# 🔍 LEARNING NOTE: In Phase 1, we only have two services: the app and PostgreSQL.
-# No Kafka, no Redis — we haven't earned those yet.
-# Notice how simple this is. Cherish this simplicity.
-# By Phase 3, this file will have 8+ services.
+# 🔍 LEARNING NOTE: Phase 2 adds Kafka to the mix.
+# Notice how the infrastructure complexity jumped:
+#   Phase 1: 2 services (app + postgres)
+#   Phase 2: 6 services (app + postgres + kafka + kafka-init + kafka-ui + notification-consumer)
+#
+# This is the operational cost of distributed systems.
+# Each service needs monitoring, health checks, log aggregation,
+# and failure handling. The code got simpler (async events),
+# but the infrastructure got more complex. This is the tradeoff.
 
 services:
   # ─────────────────────────────────────────────────
@@ -20,16 +25,7 @@ services:
       POSTGRES_PASSWORD: orderplatform_dev
       POSTGRES_DB: order_platform
     volumes:
-      # Persist data across container restarts
       - postgres_data:/var/lib/postgresql/data
-
-      # Auto-run schema on first start
-      # 🔍 LEARNING NOTE: Files in /docker-entrypoint-initdb.d/ run only on
-      # first initialization (when data volume is empty). If you change the
-      # schema, you need to either:
-      #   1. docker compose down -v (deletes data!)
-      #   2. Run ALTER TABLE migrations manually
-      # In production, you'd use a migration tool (Flyway, knex migrations, etc.)
       - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U orderplatform -d order_platform"]
@@ -39,8 +35,131 @@ services:
       start_period: 10s
 
   # ─────────────────────────────────────────────────
-  # Application — The Monolith
+  # Kafka — Event Bus (KRaft mode, no ZooKeeper)
   # ─────────────────────────────────────────────────
+  # 🔍 LEARNING NOTE: Kafka in KRaft mode removes the ZooKeeper dependency.
+  #
+  # Previously, Kafka used ZooKeeper for:
+  # - Broker metadata (which brokers are alive?)
+  # - Controller election (which broker manages partition assignments?)
+  # - Topic configuration storage
+  #
+  # KRaft (Kafka Raft) replaces ZooKeeper with a built-in Raft consensus
+  # protocol. One less service to operate. Kafka 4.0+ dropped ZooKeeper entirely.
+  #
+  # Key config explained:
+  # - KAFKA_NODE_ID: Unique broker identifier (like a server name)
+  # - KAFKA_PROCESS_ROLES: This node is BOTH a broker and controller
+  #   (in production, these are separate nodes for fault isolation)
+  # - KAFKA_LISTENERS: Network interfaces Kafka listens on
+  #   - PLAINTEXT://0.0.0.0:9092 — for client connections
+  #   - CONTROLLER://0.0.0.0:9093 — for KRaft controller protocol
+  # - KAFKA_ADVERTISED_LISTENERS: What clients use to connect
+  #   - "kafka:9092" works inside Docker network
+  #   - For host access, we'd add EXTERNAL://localhost:29092
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: op-kafka
+    ports:
+      - "29092:9092"
+    environment:
+      # KRaft mode configuration
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      # Listeners — bind to all interfaces inside the container
+      # 🔍 LEARNING NOTE: The apache/kafka image requires that
+      # advertised.listeners uses routable addresses, not 0.0.0.0.
+      # PLAINTEXT is for Docker-internal traffic (other containers use "kafka:9092").
+      # CONTROLLER is for KRaft consensus (internal only, not advertised).
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Topic defaults
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # 🔍 LEARNING NOTE: NEVER enable auto.create.topics in production.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # Log retention
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────
+  # Kafka Init — Create Topics
+  # ─────────────────────────────────────────────────
+  # 🔍 LEARNING NOTE: This is an init container — it runs once on
+  # startup, creates the topics, and exits. This pattern is common
+  # in Kubernetes (initContainers) and Docker Compose.
+  #
+  # Why explicit topic creation?
+  # - Control partition count (affects max parallelism)
+  # - Control replication factor (affects durability)
+  # - Prevent accidental topic creation from typos
+  kafka-init:
+    image: apache/kafka:3.9.0
+    container_name: op-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    # 🔍 LEARNING NOTE: 3 partitions = up to 3 parallel consumers.
+    # Partition count is the maximum parallelism for a topic.
+    # You can increase partitions later, but you CANNOT decrease them.
+    # And increasing partitions changes key→partition mapping, which
+    # can break ordering guarantees. Choose carefully.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Creating Kafka topics..."
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists \
+          --topic order-events \
+          --partitions 3 \
+          --replication-factor 1
+        echo "Topics created:"
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+        echo "Done."
+    restart: "no"
+
+  # ─────────────────────────────────────────────────
+  # Kafka UI — Visual Dashboard
+  # ─────────────────────────────────────────────────
+  # 🔍 LEARNING NOTE: Kafka UI lets you:
+  # - Browse topics and see messages (great for debugging)
+  # - Monitor consumer group lag (the #1 Kafka health metric)
+  # - View partition distribution
+  # - Inspect message keys, values, headers
+  #
+  # Access at: http://localhost:8080
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: op-kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: order-platform
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ─────────────────────────────────────────────────
+  # Order API — HTTP Server + Kafka Producer
+  # ─────────────────────────────────────────────────
+  # 🔍 LEARNING NOTE: The app now has TWO responsibilities:
+  # 1. Handle HTTP requests (same as Phase 1)
+  # 2. Publish events to Kafka (NEW in Phase 2)
+  #
+  # It does NOT consume events — that's the notification-consumer's job.
+  # This separation is critical for independent scaling and fault isolation.
   app:
     build:
       context: .
@@ -52,37 +171,72 @@ services:
       NODE_ENV: development
       PORT: 3000
       HOST: 0.0.0.0
-
-      # 🔍 LEARNING NOTE: Inside Docker network, services reference each other
-      # by service name (postgres), not localhost. Docker Compose creates a
-      # shared network where service names resolve via internal DNS.
-
       DATABASE_URL: postgresql://orderplatform:orderplatform_dev@postgres:5432/order_platform
       DB_POOL_MIN: 2
       DB_POOL_MAX: 10
       LOG_LEVEL: debug
+      # 🔍 LEARNING NOTE: These notification settings are now only used
+      # by the notification CONSUMER, not the API. But we keep them here
+      # so you can experiment with the load test comparisons.
       NOTIFICATION_DELAY_MS: 500
       NOTIFICATION_FAILURE_RATE: 0.0
-      SHUTDOWN_TIMEOUT_MS: 10000
-
+      # Kafka configuration
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CLIENT_ID: order-api
+      KAFKA_TOPIC_ORDER_EVENTS: order-events
     depends_on:
       postgres:
-        # 🔍 LEARNING NOTE: "service_healthy" means Docker waits until
-        # PostgreSQL's healthcheck passes before starting the app.
-        # Without this, the app might start before the DB is ready,
-        # causing connection errors on startup.
         condition: service_healthy
-
-    # 🔍 LEARNING NOTE: In dev, we mount source code so tsx watch picks up changes.
-    # In production, you'd never mount source code — the image contains everything.
-    volumes:
-      - ./src:/app/src
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  # ─────────────────────────────────────────────────
+  # Notification Consumer — Async Event Processing
+  # ─────────────────────────────────────────────────
+  # 🔍 LEARNING NOTE: This is a SEPARATE process from the API.
+  # Same Docker image, different CMD. This is the pattern:
+  #   app:                   node dist/index.js           (HTTP server)
+  #   notification-consumer: node dist/consumers/index.js (Kafka consumer)
+  #
+  # Why separate processes?
+  # 1. If the consumer crashes, the API keeps running (fault isolation)
+  # 2. You can scale consumers independently of the API
+  # 3. Resource-intensive event processing doesn't steal CPU from HTTP
+  # 4. You can deploy consumer fixes without restarting the API
+  notification-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: op-notification-consumer
+    command: ["node", "dist/consumers/index.js"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://orderplatform:orderplatform_dev@postgres:5432/order_platform
+      DB_POOL_MIN: 1
+      DB_POOL_MAX: 3
+      LOG_LEVEL: debug
+      NOTIFICATION_DELAY_MS: 500
+      NOTIFICATION_FAILURE_RATE: 0.0
+      # Kafka configuration
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CLIENT_ID: notification-consumer
+      KAFKA_CONSUMER_GROUP_ID: notification-service
+      KAFKA_TOPIC_ORDER_EVENTS: order-events
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
 
 volumes:
   postgres_data:
