@@ -39,6 +39,26 @@ const configSchema = z.object({
     kafkaConsumerGroupId: z.string().default('notification-service'),
     kafkaTopicOrderEvents: z.string().default('order-events'),
 
+    // Kafka DLQ (Phase 3)
+    // 🔍 LEARNING NOTE: Dead Letter Queue topic for events that exhaust
+    // all retry attempts. Ops team monitors this topic for investigation.
+    kafkaTopicDlq: z.string().default('order-events-dlq'),
+
+    // Consumer retry (Phase 3)
+    // 🔍 LEARNING NOTE: Exponential backoff with jitter prevents the
+    // "thundering herd" problem where all consumers retry simultaneously
+    // after a downstream outage, overwhelming the recovering service.
+    consumerMaxRetries: z.coerce.number().int().min(0).default(3),
+    consumerRetryBaseDelayMs: z.coerce.number().int().min(100).default(1000),
+
+    // Outbox relay (Phase 3)
+    // 🔍 LEARNING NOTE: The relay polls the outbox table at this interval.
+    // Lower = faster event delivery, but more DB load.
+    // Higher = less DB load, but events sit in outbox longer.
+    // 1 second is a good balance for most use cases.
+    outboxPollIntervalMs: z.coerce.number().int().min(100).default(1000),
+    outboxBatchSize: z.coerce.number().int().min(1).default(50),
+
     // Graceful Shutdown
     shutdownTimeoutMs: z.coerce.number().int().positive().default(10000),
 });
@@ -62,6 +82,11 @@ function loadConfig(): Config {
         kafkaClientId: process.env['KAFKA_CLIENT_ID'],
         kafkaConsumerGroupId: process.env['KAFKA_CONSUMER_GROUP_ID'],
         kafkaTopicOrderEvents: process.env['KAFKA_TOPIC_ORDER_EVENTS'],
+        kafkaTopicDlq: process.env['KAFKA_TOPIC_DLQ'],
+        consumerMaxRetries: process.env['CONSUMER_MAX_RETRIES'],
+        consumerRetryBaseDelayMs: process.env['CONSUMER_RETRY_BASE_DELAY_MS'],
+        outboxPollIntervalMs: process.env['OUTBOX_POLL_INTERVAL_MS'],
+        outboxBatchSize: process.env['OUTBOX_BATCH_SIZE'],
         shutdownTimeoutMs: process.env['SHUTDOWN_TIMEOUT_MS'],
     });
 

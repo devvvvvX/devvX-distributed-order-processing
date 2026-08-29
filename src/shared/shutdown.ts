@@ -1,5 +1,5 @@
 // ============================================================
-// Graceful Shutdown
+// Graceful Shutdown (Phase 3: + Outbox Relay)
 // ============================================================
 // 🔍 LEARNING NOTE: Graceful shutdown is one of the most important
 // production patterns, and one of the most commonly overlooked.
@@ -16,25 +16,35 @@
 // 1. SIGTERM received
 // 2. Stop accepting NEW connections (server.close())
 // 3. Wait for in-flight requests to complete (with timeout)
-// 4. Close database connections cleanly
-// 5. Exit with code 0
+// 4. Stop outbox relay (flush any in-progress batch)
+// 5. Close database connections cleanly
+// 6. Exit with code 0
 //
-// The timeout is critical: if an in-flight request is stuck (deadlock,
-// slow query), you can't wait forever. The timeout forces exit.
+// 🔍 PHASE 3 EVOLUTION:
+// Added OutboxRelay to the shutdown sequence. The relay must stop
+// BEFORE the Kafka producer disconnects, because it uses the producer
+// to publish events. And the producer must disconnect BEFORE the DB
+// pool closes, because the relay reads from the DB.
 //
-// In Kubernetes, there's also a terminationGracePeriodSeconds
-// (default 30s). If your app doesn't exit in that time, Kubernetes
-// sends SIGKILL (unblockable). Your shutdown timeout should be
-// LESS than terminationGracePeriodSeconds.
+// Shutdown order:
+//   HTTP server → Outbox relay → Kafka producer → DB pool
+// (reverse of startup order — a general best practice)
+
 import { FastifyInstance } from "fastify";
 import { Pool } from "pg";
 import { createModuleLogger } from "./logger.js";
 import { config } from "../config";
 import { EventProducer } from "../kafka/producer.js";
+import { OutboxRelay } from "../outbox/outbox-relay.js";
 
 const log = createModuleLogger("shutdown");
 
-export function setupGracefulShutdown(app: FastifyInstance, pool: Pool, eventProducer: EventProducer | null = null): void {
+export function setupGracefulShutdown(
+  app: FastifyInstance,
+  pool: Pool,
+  eventProducer: EventProducer | null = null,
+  outboxRelay: OutboxRelay | null = null
+): void {
   let isShuttingDown = false;
 
   async function shutdown(signal: string): Promise<void> {
@@ -68,7 +78,17 @@ export function setupGracefulShutdown(app: FastifyInstance, pool: Pool, eventPro
       await app.close();
       log.info("✅ HTTP server closed");
 
-      // Step 2: Disconnect Kafka producer (flush pending events)
+      // Step 2: Stop outbox relay (wait for in-progress batch)
+      // 🔍 PHASE 3 ADDITION: Stop the relay BEFORE disconnecting
+      // the Kafka producer, because the relay needs the producer
+      // to finish publishing any in-progress batch.
+      if (outboxRelay) {
+        log.info('Stop outbox relay...');
+        await outboxRelay.stop();
+        log.info('✅ Outbox relay stopped');
+      }
+
+      // Step 3: Disconnect Kafka producer (flush pending events)
       // 🔍 LEARNING NOTE: The producer's disconnect() flushes its
       // internal buffer, ensuring no events are lost. This must happen
       // BEFORE closing the DB pool because the producer might still
@@ -79,7 +99,7 @@ export function setupGracefulShutdown(app: FastifyInstance, pool: Pool, eventPro
         log.info('✅ Kafka producer disconnected');
       }
 
-      // Step 3: Close database pool
+      // Step 4: Close database pool
       // This waits for active queries to finish, then closes connections.
       log.info("Closing database pool...");
       await pool.end();

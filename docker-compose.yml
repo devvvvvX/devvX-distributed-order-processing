@@ -1,16 +1,24 @@
 # ============================================================
-# Phase 2 — Docker Compose: Event-Driven Architecture
+# Phase 3 — Docker Compose: Reliable Distributed Processing
 # ============================================================
-# 🔍 LEARNING NOTE: Phase 2 adds Kafka to the mix.
-# Notice how the infrastructure complexity jumped:
+# 🔍 LEARNING NOTE: Phase 3 infrastructure changes:
 #   Phase 1: 2 services (app + postgres)
-#   Phase 2: 6 services (app + postgres + kafka + kafka-init + kafka-ui + notification-consumer)
+#   Phase 2: 6 services (app + postgres + kafka + kafka-init + kafka-ui + 1 consumer)
+#   Phase 3: 8 services (app + postgres + kafka + kafka-init + kafka-ui + 3 consumers)
 #
-# This is the operational cost of distributed systems.
-# Each service needs monitoring, health checks, log aggregation,
-# and failure handling. The code got simpler (async events),
-# but the infrastructure got more complex. This is the tradeoff.
-
+# What changed:
+# 1. kafka-init now creates TWO topics: order-events + order-events-dlq
+# 2. The single notification-consumer is now 3 EXPLICIT consumer instances
+#    (all sharing the same consumer group → Kafka assigns 1 partition per consumer)
+# 3. The app now runs an OutboxRelay (background poller)
+# 4. New config vars: DLQ topic, retry settings, outbox polling
+#
+# 🔍 LEARNING NOTE: Why 3 explicit services instead of `deploy.replicas: 3`?
+# - Explicit services have NAMED containers → distinct log streams
+# - Each container has a unique KAFKA_CLIENT_ID → easy to identify in Kafka UI
+# - You can stop/start individual consumers to observe rebalancing
+# - Better for LEARNING because you see each consumer's behavior independently
+# In production, you'd use Kubernetes Deployments with replicas.
 services:
   # ─────────────────────────────────────────────────
   # PostgreSQL — Our single source of truth
@@ -37,26 +45,6 @@ services:
   # ─────────────────────────────────────────────────
   # Kafka — Event Bus (KRaft mode, no ZooKeeper)
   # ─────────────────────────────────────────────────
-  # 🔍 LEARNING NOTE: Kafka in KRaft mode removes the ZooKeeper dependency.
-  #
-  # Previously, Kafka used ZooKeeper for:
-  # - Broker metadata (which brokers are alive?)
-  # - Controller election (which broker manages partition assignments?)
-  # - Topic configuration storage
-  #
-  # KRaft (Kafka Raft) replaces ZooKeeper with a built-in Raft consensus
-  # protocol. One less service to operate. Kafka 4.0+ dropped ZooKeeper entirely.
-  #
-  # Key config explained:
-  # - KAFKA_NODE_ID: Unique broker identifier (like a server name)
-  # - KAFKA_PROCESS_ROLES: This node is BOTH a broker and controller
-  #   (in production, these are separate nodes for fault isolation)
-  # - KAFKA_LISTENERS: Network interfaces Kafka listens on
-  #   - PLAINTEXT://0.0.0.0:9092 — for client connections
-  #   - CONTROLLER://0.0.0.0:9093 — for KRaft controller protocol
-  # - KAFKA_ADVERTISED_LISTENERS: What clients use to connect
-  #   - "kafka:9092" works inside Docker network
-  #   - For host access, we'd add EXTERNAL://localhost:29092
   kafka:
     image: apache/kafka:3.9.0
     container_name: op-kafka
@@ -67,11 +55,6 @@ services:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
-      # Listeners — bind to all interfaces inside the container
-      # 🔍 LEARNING NOTE: The apache/kafka image requires that
-      # advertised.listeners uses routable addresses, not 0.0.0.0.
-      # PLAINTEXT is for Docker-internal traffic (other containers use "kafka:9092").
-      # CONTROLLER is for KRaft consensus (internal only, not advertised).
       KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
@@ -81,7 +64,6 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      # 🔍 LEARNING NOTE: NEVER enable auto.create.topics in production.
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       # Log retention
       KAFKA_LOG_RETENTION_HOURS: 168
@@ -94,27 +76,23 @@ services:
       start_period: 30s
 
   # ─────────────────────────────────────────────────
-  # Kafka Init — Create Topics
+  # Kafka Init — Create Topics (Phase 3: + DLQ topic)
   # ─────────────────────────────────────────────────
-  # 🔍 LEARNING NOTE: This is an init container — it runs once on
-  # startup, creates the topics, and exits. This pattern is common
-  # in Kubernetes (initContainers) and Docker Compose.
+  # 🔍 PHASE 3 CHANGE: Now creates TWO topics:
+  #   order-events     — Main event topic (3 partitions)
+  #   order-events-dlq — Dead Letter Queue (1 partition)
   #
-  # Why explicit topic creation?
-  # - Control partition count (affects max parallelism)
-  # - Control replication factor (affects durability)
-  # - Prevent accidental topic creation from typos
+  # 🔍 LEARNING NOTE: DLQ has only 1 partition because:
+  # - DLQ events are rare (only on exhausted retries)
+  # - We want ALL DLQ events in one place for easy investigation
+  # - No need for parallel processing of DLQ events
+  # - Ordering in DLQ is by failure time, not by entity
   kafka-init:
     image: apache/kafka:3.9.0
     container_name: op-kafka-init
     depends_on:
       kafka:
         condition: service_healthy
-    # 🔍 LEARNING NOTE: 3 partitions = up to 3 parallel consumers.
-    # Partition count is the maximum parallelism for a topic.
-    # You can increase partitions later, but you CANNOT decrease them.
-    # And increasing partitions changes key→partition mapping, which
-    # can break ordering guarantees. Choose carefully.
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -124,7 +102,17 @@ services:
           --topic order-events \
           --partitions 3 \
           --replication-factor 1
-        echo "Topics created:"
+        echo "✅ Created topic: order-events (3 partitions)"
+
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists \
+          --topic order-events-dlq \
+          --partitions 1 \
+          --replication-factor 1
+        echo "✅ Created topic: order-events-dlq (1 partition - Dead Letter Queue)"
+
+        echo ""
+        echo "All topics:"
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
         echo "Done."
     restart: "no"
@@ -132,13 +120,6 @@ services:
   # ─────────────────────────────────────────────────
   # Kafka UI — Visual Dashboard
   # ─────────────────────────────────────────────────
-  # 🔍 LEARNING NOTE: Kafka UI lets you:
-  # - Browse topics and see messages (great for debugging)
-  # - Monitor consumer group lag (the #1 Kafka health metric)
-  # - View partition distribution
-  # - Inspect message keys, values, headers
-  #
-  # Access at: http://localhost:8080
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: op-kafka-ui
@@ -152,14 +133,15 @@ services:
         condition: service_healthy
 
   # ─────────────────────────────────────────────────
-  # Order API — HTTP Server + Kafka Producer
+  # Order API — HTTP Server + Outbox Relay
   # ─────────────────────────────────────────────────
-  # 🔍 LEARNING NOTE: The app now has TWO responsibilities:
-  # 1. Handle HTTP requests (same as Phase 1)
-  # 2. Publish events to Kafka (NEW in Phase 2)
+  # 🔍 PHASE 3 CHANGE: The app now has THREE responsibilities:
+  # 1. Handle HTTP requests (same as Phase 1-2)
+  # 2. Write events to outbox table (atomic with order writes)
+  # 3. Run OutboxRelay (polls outbox → publishes to Kafka)
   #
-  # It does NOT consume events — that's the notification-consumer's job.
-  # This separation is critical for independent scaling and fault isolation.
+  # The EventProducer is NO LONGER injected into the OrderService.
+  # The OrderService only writes to Postgres. The relay handles Kafka.
   app:
     build:
       context: .
@@ -175,15 +157,16 @@ services:
       DB_POOL_MIN: 2
       DB_POOL_MAX: 10
       LOG_LEVEL: debug
-      # 🔍 LEARNING NOTE: These notification settings are now only used
-      # by the notification CONSUMER, not the API. But we keep them here
-      # so you can experiment with the load test comparisons.
       NOTIFICATION_DELAY_MS: 500
       NOTIFICATION_FAILURE_RATE: 0.0
-      # Kafka configuration
+      # Kafka configuration (for outbox relay)
       KAFKA_BROKERS: kafka:9092
       KAFKA_CLIENT_ID: order-api
       KAFKA_TOPIC_ORDER_EVENTS: order-events
+      KAFKA_TOPIC_DLQ: order-events-dlq
+      # Outbox relay configuration (Phase 3)
+      OUTBOX_POLL_INTERVAL_MS: 1000
+      OUTBOX_BATCH_SIZE: 50
     depends_on:
       postgres:
         condition: service_healthy
@@ -199,23 +182,45 @@ services:
       start_period: 15s
 
   # ─────────────────────────────────────────────────
-  # Notification Consumer — Async Event Processing
+  # Notification Consumers — Consumer Group (3 instances)
   # ─────────────────────────────────────────────────
-  # 🔍 LEARNING NOTE: This is a SEPARATE process from the API.
-  # Same Docker image, different CMD. This is the pattern:
-  #   app:                   node dist/index.js           (HTTP server)
-  #   notification-consumer: node dist/consumers/index.js (Kafka consumer)
+  # 🔍 PHASE 3 CHANGE: Scaled from 1 consumer to 3 consumers.
   #
-  # Why separate processes?
-  # 1. If the consumer crashes, the API keeps running (fault isolation)
-  # 2. You can scale consumers independently of the API
-  # 3. Resource-intensive event processing doesn't steal CPU from HTTP
-  # 4. You can deploy consumer fixes without restarting the API
-  notification-consumer:
+  # All 3 share the SAME consumer group ID (notification-service).
+  # Kafka assigns each consumer a subset of partitions:
+  #   Consumer 1 → Partition 0
+  #   Consumer 2 → Partition 1
+  #   Consumer 3 → Partition 2
+  #
+  # 🔍 LEARNING NOTE: CONSUMER GROUP MECHANICS
+  #
+  # MAX PARALLELISM = min(consumers, partitions)
+  # - 3 partitions, 3 consumers → each gets 1 partition (optimal)
+  # - 3 partitions, 2 consumers → one consumer gets 2 partitions
+  # - 3 partitions, 4 consumers → one consumer sits IDLE (wasted)
+  #
+  # This is why you choose partition count carefully at topic creation.
+  # You can't decrease partitions, and increasing changes key→partition mapping.
+  #
+  # REBALANCING happens when:
+  # - A consumer joins the group (new container starts)
+  # - A consumer leaves (container stops or session timeout)
+  # - Partitions change (topic altered)
+  #
+  # During rebalance: ALL consumers in the group STOP processing briefly.
+  # This is the most disruptive Kafka operation. Idempotency protects
+  # against duplicates caused by rebalancing.
+  #
+  # EXPERIMENT: Try stopping one consumer and watch Kafka UI!
+  #   docker compose stop notification-consumer-2
+  #   → Consumer 1 and 3 pick up partition 1
+  #   docker compose start notification-consumer-2
+  #   → Rebalance: partition 1 goes back to consumer 2
+  notification-consumer-1:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: op-notification-consumer
+    container_name: op-notification-consumer-1
     command: ["node", "dist/consumers/index.js"]
     environment:
       NODE_ENV: development
@@ -227,9 +232,81 @@ services:
       NOTIFICATION_FAILURE_RATE: 0.0
       # Kafka configuration
       KAFKA_BROKERS: kafka:9092
-      KAFKA_CLIENT_ID: notification-consumer
+      KAFKA_CLIENT_ID: notification-consumer-1
       KAFKA_CONSUMER_GROUP_ID: notification-service
       KAFKA_TOPIC_ORDER_EVENTS: order-events
+      KAFKA_TOPIC_DLQ: order-events-dlq
+      # Retry configuration (Phase 3)
+      CONSUMER_MAX_RETRIES: 3
+      CONSUMER_RETRY_BASE_DELAY_MS: 1000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+  
+  # ─────────────────────────────────────────────────
+  # Notification Consumer 2
+  # ─────────────────────────────────────────────────
+  notification-consumer-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: op-notification-consumer-2
+    command: ["node", "dist/consumers/index.js"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://orderplatform:orderplatform_dev@postgres:5432/order_platform
+      DB_POOL_MIN: 1
+      DB_POOL_MAX: 3
+      LOG_LEVEL: debug
+      NOTIFICATION_DELAY_MS: 500
+      NOTIFICATION_FAILURE_RATE: 0.0
+      # Kafka configuration
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CLIENT_ID: notification-consumer-2
+      KAFKA_CONSUMER_GROUP_ID: notification-service
+      KAFKA_TOPIC_ORDER_EVENTS: order-events
+      KAFKA_TOPIC_DLQ: order-events-dlq
+      # Retry configuration (Phase 3)
+      CONSUMER_MAX_RETRIES: 3
+      CONSUMER_RETRY_BASE_DELAY_MS: 1000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  # ─────────────────────────────────────────────────
+  # Notification Consumer 3
+  # ─────────────────────────────────────────────────
+  notification-consumer-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: op-notification-consumer-3
+    command: ["node", "dist/consumers/index.js"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://orderplatform:orderplatform_dev@postgres:5432/order_platform
+      DB_POOL_MIN: 1
+      DB_POOL_MAX: 3
+      LOG_LEVEL: debug
+      NOTIFICATION_DELAY_MS: 500
+      NOTIFICATION_FAILURE_RATE: 0.0
+      # Kafka configuration
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CLIENT_ID: notification-consumer-3
+      KAFKA_CONSUMER_GROUP_ID: notification-service
+      KAFKA_TOPIC_ORDER_EVENTS: order-events
+      KAFKA_TOPIC_DLQ: order-events-dlq
+      # Retry configuration (Phase 3)
+      CONSUMER_MAX_RETRIES: 3
+      CONSUMER_RETRY_BASE_DELAY_MS: 1000
     depends_on:
       postgres:
         condition: service_healthy

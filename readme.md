@@ -10,7 +10,7 @@
 |---|---|---|
 | **1 — Monolith** ✅ | Fastify + PostgreSQL | Request lifecycle, transactions, idempotency, graceful shutdown |
 | **2 — Event-Driven** ✅ | + Kafka | Producers, consumers, topics, partitions, async processing |
-| **3 — Distributed Processing** | + Consumer groups | At-least-once delivery, idempotency, DLQs, event replay |
+| **3 — Distributed Processing** ✅ | + Consumer groups | Transactional outbox, idempotency, DLQs, retry, consumer scaling |
 | **4 — Coordination** | + Redis | Distributed locks, leader election, race conditions |
 | **5 — Realtime** | + SSE | Streaming, backpressure, connection management |
 | **6 — Observability** | + Prometheus/Grafana | Metrics, tracing, structured logging |
@@ -82,25 +82,84 @@ Client → Fastify (HTTP) → OrderService → OrderRepository → PostgreSQL
 └────────────────────────────────┘
 ```
 
+---
+
+## Phase 3 — Reliable Distributed Processing
+
+### What You'll Learn in Phase 3
+
+- **Transactional Outbox Pattern**: Eliminate the dual-write problem — order + event in one DB transaction.
+- **Polling Publisher (Outbox Relay)**: Background process that bridges PostgreSQL → Kafka.
+- **Idempotent Consumers**: Prevent duplicate processing with a `processed_events` table.
+- **Exponential Backoff with Jitter**: Retry transient failures without thundering herd.
+- **Dead Letter Queue (DLQ)**: Where permanently failing events go for investigation.
+- **Consumer Groups & Rebalancing**: How Kafka distributes partitions across multiple consumers.
+
+### Architecture (Phase 3)
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                   ORDER API (Fastify + Outbox Relay)                │
+│                                                                    │
+│  POST /orders ─────────────────────────────┐                       │
+│                                            │                       │
+│    BEGIN TRANSACTION                       │                       │
+│      INSERT INTO orders (...)              │                       │
+│      INSERT INTO outbox_events (...)       │ ← ATOMIC!            │
+│    COMMIT                                  │                       │
+│    Respond 201 (~20ms)                     │                       │
+│                                            │                       │
+│  ┌─────────────────────────────────────────▼──────────────────┐    │
+│  │  Outbox Relay (polls every 1s)                             │    │
+│  │  SELECT outbox WHERE published_at IS NULL                  │    │
+│  │  → kafka.produce(event)                                    │    │
+│  │  → UPDATE published_at = NOW()                             │    │
+│  └─────────────────────────┬──────────────────────────────────┘    │
+└────────────────────────────┼───────────────────────────────────────┘
+                             │ produce
+                             ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                         KAFKA                                      │
+│  order-events (3 partitions)     order-events-dlq (1 partition)   │
+└──────────────┬─────────────────────────────────────────────────────┘
+               │ consume (consumer group: notification-service)
+               ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  CONSUMER GROUP (3 instances → 1 partition each)                   │
+│                                                                    │
+│  For each event:                                                   │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │ 1. Idempotency check (processed_events table)                │  │
+│  │    → Already processed? SKIP                                 │  │
+│  │ 2. Process with retry (3 attempts, exponential backoff)      │  │
+│  │    → Success? Mark processed + commit offset                 │  │
+│  │    → All fail? Publish to DLQ + commit offset                │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────┘
+```
+
 ### Quick Start
 
 ```bash
 # 1. Setup environment variables
 cp .env.example .env
 
-# 2. Start services (includes Kafka, Postgres, App, Consumer, Kafka UI)
+# 2. Start services (includes 3 consumer replicas!)
 docker compose up --build -d
 
-# 3. Verify health of the Order API
+# 3. Verify health
 curl http://localhost:3000/health
 
-# 4. Stream consumer logs in another terminal to watch events process in real-time
-docker compose logs -f notification-consumer
+# 4. Check consumer group — all 3 consumers with partition assignments
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group notification-service
 
-# 5. Create an order and watch the logs (notice the ultra-fast ~20ms response time!)
+# 5. Create an order and watch all 3 consumer logs
+docker compose logs -f notification-consumer-1 notification-consumer-2 notification-consumer-3
+
 time curl -X POST http://localhost:3000/api/v1/orders \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: phase2-test-001" \
+  -H "Idempotency-Key: phase3-test-001" \
   -d '{
     "customerId": "cust-001",
     "customerName": "Alice Johnson",
@@ -117,7 +176,15 @@ time curl -X POST http://localhost:3000/api/v1/orders \
     ]
   }'
 
-# 6. Open Kafka UI to inspect topics, offsets, and consumer groups
+# 6. Verify outbox was relayed
+docker compose exec postgres psql -U orderplatform -d order_platform \
+  -c "SELECT event_type, published_at FROM outbox_events ORDER BY created_at DESC LIMIT 5;"
+
+# 7. Verify idempotency tracking
+docker compose exec postgres psql -U orderplatform -d order_platform \
+  -c "SELECT * FROM processed_events ORDER BY processed_at DESC LIMIT 5;"
+
+# 8. Open Kafka UI — inspect topics, consumer group, DLQ
 open http://localhost:8080
 ```
 
@@ -128,31 +195,10 @@ open http://localhost:8080
 | `POST` | `/api/v1/orders` | Create order (supports `Idempotency-Key` header) |
 | `GET` | `/api/v1/orders` | List orders (`?page=1&limit=20&status=PENDING&customerId=x`) |
 | `GET` | `/api/v1/orders/:id` | Get order by ID |
-| `PATCH` | `/api/v1/orders/:id/status` | Update order status (publishes event) |
-| `POST` | `/api/v1/orders/:id/cancel` | Cancel order (publishes event) |
+| `PATCH` | `/api/v1/orders/:id/status` | Update order status (publishes event via outbox) |
+| `POST` | `/api/v1/orders/:id/cancel` | Cancel order (publishes event via outbox) |
 | `GET` | `/api/v1/orders/:id/history` | Get status change history |
 | `GET` | `/health` | Health check + DB pool metrics |
-
-### Feel the Decoupled Speed
-
-```bash
-# Make the script executable
-chmod +x scripts/load-test.sh
-
-# Run 20 concurrent requests — see average latency stay low (~20ms per order)!
-# The database connection pool is no longer blocked waiting for external notification calls.
-./scripts/load-test.sh 20 concurrent
-```
-
-### Inspect the Database
-
-```bash
-# Connect to PostgreSQL
-docker compose exec postgres psql -U orderplatform -d order_platform
-
-# Check the notification status — they should eventually update from PENDING to SENT!
-SELECT order_id, type, status, retry_count, sent_at FROM notifications;
-```
 
 ### Stop the System
 
@@ -171,42 +217,49 @@ docker compose down -v
 ```
 order-platform/
 ├── src/
-│   ├── index.ts                    # Entry point (startup sequence)
+│   ├── index.ts                    # Entry point (startup + outbox relay)
 │   ├── server.ts                   # Fastify bootstrap, plugins, error handler
 │   ├── config/index.ts             # Typed config with Zod validation
 │   ├── db/pool.ts                  # PostgreSQL connection pool
-│   ├── kafka/                      # NEW — Kafka Infrastructure Layer
+│   ├── outbox/                     # Phase 3 — Transactional Outbox
+│   │   ├── outbox.repository.ts    # Insert/query outbox events
+│   │   └── outbox-relay.ts         # Background poller → Kafka publisher
+│   ├── kafka/                      # Kafka Infrastructure Layer
 │   │   ├── client.ts               # KafkaJS client wrapper
-│   │   ├── producer.ts             # Event producer logic
-│   │   ├── consumer.ts             # Base Kafka consumer runner
-│   │   └── events.ts               # Typed event envelopes & builders
-│   ├── consumers/                  # NEW — Background Consumer Services
+│   │   ├── producer.ts             # Event producer (used by outbox relay)
+│   │   ├── consumer.ts             # Reliable consumer (retry + idempotency + DLQ)
+│   │   ├── events.ts               # Typed event envelopes & builders
+│   │   ├── idempotency.ts          # Phase 3 — processed_events table guard
+│   │   ├── retry.ts                # Phase 3 — Exponential backoff + jitter
+│   │   └── dlq-producer.ts         # Phase 3 — Dead Letter Queue publisher
+│   ├── consumers/                  # Background Consumer Services
 │   │   ├── index.ts                # Consumer process entry point
 │   │   └── notification-consumer.ts# Business handler for order notifications
 │   ├── shared/
 │   │   ├── logger.ts               # Pino structured logger
 │   │   ├── errors.ts               # Custom error classes
 │   │   ├── health.ts               # /health endpoint
-│   │   └── shutdown.ts             # Graceful shutdown handler
+│   │   └── shutdown.ts             # Graceful shutdown (+ outbox relay)
 │   ├── modules/
 │   │   ├── orders/
 │   │   │   ├── order.types.ts      # Domain types + state machine
 │   │   │   ├── order.schemas.ts    # Zod validation schemas
-│   │   │   ├── order.repository.ts # Data access layer (SQL)
-│   │   │   ├── order.service.ts    # Business logic (modified to produce events)
+│   │   │   ├── order.repository.ts # Data access (with outbox callback)
+│   │   │   ├── order.service.ts    # Business logic (outbox pattern)
 │   │   │   └── order.routes.ts     # HTTP handlers
 │   │   └── notifications/
 │   │       ├── notification.types.ts
 │   │       ├── notification.repository.ts
-│   │       └── notification.service.ts  # Triggered asynchronously by consumer
+│   │       └── notification.service.ts
 │   └── types/index.ts              # Shared TypeScript types
 ├── scripts/
-│   ├── init-db.sql                 # PostgreSQL schema (DDL)
+│   ├── init-db.sql                 # PostgreSQL schema (+ outbox + processed_events)
 │   └── load-test.sh                # Load test script
 ├── docs/
 │   ├── phase-1-architecture.md     # Phase 1 design notes
-│   └── phase-2-architecture.md     # Phase 2 Kafka Architecture Decision Record
-├── docker-compose.yml
+│   ├── phase-2-architecture.md     # Phase 2 Kafka Architecture Decision Record
+│   └── phase-3-architecture.md     # Phase 3 Reliability Architecture Decision Record
+├── docker-compose.yml              # 8 services (3 consumer replicas)
 ├── Dockerfile
 └── .env.example
 ```
@@ -224,4 +277,10 @@ order-platform/
 | **Decoupled architecture**| Phase 2 | `notification-consumer.ts` | Isolates core database transactions from slow integrations |
 | **Event schema versioning**| Phase 2 | `kafka/events.ts` | Safely evolve payload structures over time |
 | **Message partition keying**| Phase 2 | `kafka/producer.ts` | Guarantees ordered message processing per entity |
-| **At-least-once processing**| Phase 2 | `kafka/consumer.ts` | Assures processing safety via manual offset committing |
+| **Transactional outbox** | Phase 3 | `outbox/` | Eliminates dual-write data loss between DB and Kafka |
+| **Outbox relay** | Phase 3 | `outbox/outbox-relay.ts` | Bridges PostgreSQL → Kafka asynchronously |
+| **Idempotent consumer** | Phase 3 | `kafka/idempotency.ts` | Prevents duplicate processing on re-delivery |
+| **Exponential backoff** | Phase 3 | `kafka/retry.ts` | Retries transient failures without thundering herd |
+| **Dead Letter Queue** | Phase 3 | `kafka/dlq-producer.ts` | Captures permanently failing events for investigation |
+| **Consumer groups** | Phase 3 | `docker-compose.yml` | Horizontal scaling of event processing |
+| **Partial index** | Phase 3 | `init-db.sql` | Fast outbox polling regardless of table size |

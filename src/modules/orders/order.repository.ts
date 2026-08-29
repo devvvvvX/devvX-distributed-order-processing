@@ -14,11 +14,41 @@ import { createModuleLogger } from "../../shared/logger.js";
 const log = createModuleLogger("order-repository");
 
 export class OrderRepository {
-  constructor(private readonly pool: Pool) {}
+  constructor(private readonly pool: Pool) { }
 
   // ─────────────────────────────────────────────────
   // CREATE — Transactional multi-table insert
   // ─────────────────────────────────────────────────
+  // 🔍 LEARNING NOTE: This method uses a DATABASE TRANSACTION.
+  //
+  // Why transactions matter:
+  //   Without a transaction, if we insert the order but crash before
+  //   inserting order_items, we have a corrupt order in the DB.
+  //   With a transaction, it's ALL or NOTHING:
+  //   - BEGIN: start the transaction
+  //   - INSERT order: ✅
+  //   - INSERT items: ✅ or ❌
+  //   - If any step fails → ROLLBACK: everything is undone
+  //   - If all succeed → COMMIT: everything is persisted atomically
+  //
+  // This is ACID (Atomicity, Consistency, Isolation, Durability).
+  // You get this FOR FREE with PostgreSQL transactions.
+  // In distributed systems (Phase 2+), you DON'T get this for free.
+  // That's when things get hard.
+  //
+  // 🔍 PHASE 3 EVOLUTION: The onTransaction callback
+  //
+  // The create method now accepts an optional callback that runs
+  // INSIDE the same transaction, BEFORE commit. The OrderService
+  // uses this to insert outbox events atomically with the order:
+  //
+  //   BEGIN
+  //     INSERT INTO orders       ← order data
+  //     INSERT INTO order_items  ← item data
+  //     INSERT INTO outbox_events← event data (via callback)
+  //   COMMIT
+  //
+  // All three writes succeed or fail together. No dual-write gap.
   async create(
     input: CreateOrderInput,
     idempotencyKey: string | undefined,
@@ -28,6 +58,7 @@ export class OrderRepository {
       taxAmount: number;
       grandTotal: number;
     },
+    onTransaction?: (client: PoolClient) => Promise<void>
   ): Promise<Order> {
     const client: PoolClient = await this.pool.connect();
 
@@ -99,6 +130,13 @@ export class OrderRepository {
       const orderRow = orderResult.rows[0]!;
 
       // Insert order items in batch
+      // 🔍 LEARNING NOTE: We insert items one-by-one in a loop here.
+      // For small item counts (1-10 per order), this is fine.
+      // For bulk inserts (1000+ rows), you'd use:
+      //   - COPY command (fastest)
+      //   - Multi-row INSERT VALUES (...), (...), (...)
+      //   - unnest() with array parameters
+      // Premature optimization is the root of all evil.
       const items: OrderItemRow[] = [];
       for (const item of input.items) {
         const totalPrice = item.quantity * item.unitPrice;
@@ -126,6 +164,12 @@ export class OrderRepository {
                 ) VALUES ($1, NULL, $2, $3, $4)`,
         [orderRow.id, "PENDING", "system", "Order created"],
       );
+
+      // 🔍 PHASE 3: Execute the outbox insert callback (same transaction!)
+      if (onTransaction) {
+        await onTransaction(client);
+      }
+
 
       await client.query("COMMIT");
 
@@ -272,6 +316,7 @@ export class OrderRepository {
     toStatus: OrderStatusType,
     changedBy: string,
     reason?: string,
+    onTransaction?: (client: PoolClient) => Promise<void>
   ): Promise<Order | null> {
     const client = await this.pool.connect();
 
@@ -307,6 +352,11 @@ export class OrderRepository {
         ) VALUES ($1, $2, $3, $4, $5)`,
         [id, fromStatus, toStatus, changedBy, reason ?? null],
       );
+
+      // 🔍 PHASE 3: Execute the outbox insert callback (same transaction!)
+      if (onTransaction) {
+        await onTransaction(client);
+      }
 
       // Fetch items for the response before COMMIT so a failure can still roll back.
       const itemsResult = await client.query<OrderItemRow>(
