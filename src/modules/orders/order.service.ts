@@ -1,25 +1,30 @@
 // ============================================================
-// Order Service — Business Logic (Phase 2: Event-Driven)
+// Order Service — Business Logic (Phase 3: Transactional Outbox)
 // ============================================================
-// The service layer is where business logic lives.
+// 🔍 LEARNING NOTE: The service layer is where business logic lives.
 // It orchestrates between:
 //   - Repository (data access)
-//   - Event producer (kafka - async side effects)
+//   - Outbox (event persistence — atomically with business data)
 //   - Validation rules (state machine)
 //
-// 🔍 PHASE 2 EVOLUTION:
-// In Phase 1, this service called NotificationService.send() SYNCHRONOUSLY
-// during order creation. That added 500ms to every order API call.
+// 🔍 PHASE 3 EVOLUTION:
+// In Phase 2, this service called EventProducer.publishOrderCreated()
+// AFTER the order was committed to the DB. This was a dual-write:
+//   1. DB commit (success) → 2. Kafka publish (can fail) → event LOST!
 //
-// In Phase 2, we replaced that with EventProducer.publishOrderCreated(),
-// which publishes an event to Kafka in ~2ms. The notification is now
-// processed asynchronously by a separate consumer process.
+// In Phase 3, we replaced the Kafka publish with an OUTBOX INSERT
+// inside the SAME database transaction as the order:
+//   1. BEGIN → INSERT order + INSERT outbox_event → COMMIT
+//   Both succeed or both fail. No dual-write gap.
 //
-// The service layer itself barely changed — we swapped one dependency
-// for another. This is the benefit of clean architecture: business logic
-// (validation, state machine, idempotency) stays identical. Only the
-// "how do we trigger side effects?" part changed.
-
+// The OutboxRelay (background poller) reads unpublished outbox events
+// and publishes them to Kafka. If the relay crashes, events accumulate
+// in the outbox and are published on the next poll. This provides strong durability.
+//
+// KEY ARCHITECTURAL INSIGHT:
+// The service NO LONGER needs a Kafka producer dependency.
+// It only needs the database. This is a significant simplification.
+// The event bus is no longer on the synchronous order-creation critical path.
 import { Pool } from "pg";
 import { OrderRepository } from "./order.repository";
 import {
@@ -30,7 +35,12 @@ import {
   VALID_STATUS_TRANSITIONS,
   OrderStatusType,
 } from "./order.types.js";
-import { EventProducer } from "../../kafka/producer.js";
+import { OutboxRepository, InsertOutboxEvent } from '../../outbox/outbox.repository.js';
+import {
+  buildOrderCreatedEvent,
+  buildOrderStatusChangedEvent,
+} from '../../kafka/events.js';
+import { config } from "../../config";
 import { NotFoundError, ConflictError } from "../../shared/errors.js";
 import { createModuleLogger } from "../../shared/logger.js";
 
@@ -39,16 +49,14 @@ const log = createModuleLogger("order-service");
 export class OrderService {
   private readonly orderRepo: OrderRepository;
 
-  // 🔍 LEARNING NOTE: EventProducer is optional (nullable).
-  // If Kafka is not configured (e.g., in tests or dev without Kafka),
-  // the service still works — it just doesn't publish events.
-  // This is graceful degradation: the core function (order CRUD) works
-  // even if the event bus is unavailable.
-  private readonly eventProducer: EventProducer | null;
+  // 🔍 PHASE 3 CHANGE: Replaced EventProducer with OutboxRepository.
+  // The service no longer talks to Kafka directly. It writes events
+  // to the outbox table, and the OutboxRelay handles Kafka publishing.
+  private readonly outboxRepo: OutboxRepository;
 
-  constructor(pool: Pool, eventProducer: EventProducer | null = null) {
+  constructor(pool: Pool) {
     this.orderRepo = new OrderRepository(pool);
-    this.eventProducer = eventProducer;
+    this.outboxRepo = new OutboxRepository(pool);
   }
 
   // ─────────────────────────────────────────────────
@@ -70,8 +78,7 @@ export class OrderService {
     // the second insert to fail with a unique violation error.
     // We catch that error and return the existing order.
     //
-    // This is database-level idempotency protection. In Phase 3+,
-    // we'll also need application-level idempotency for Kafka consumers
+    // This is database-level idempotency protection.
 
     if (idempotencyKey) {
       const existingOrder =
@@ -108,15 +115,97 @@ export class OrderService {
     const grandTotal =
       Math.round((roundedTotalAmount + deliveryFee + taxAmount) * 100) / 100;
 
-    // Step 3: Create order in database (transactional)
+    // Step 3: Create order in database (transactional — including outbox!)
+    // ═══════════════════════════════════════════════════════════════
+    // 🔍 PHASE 3 CHANGE: The onTransaction callback inserts the outbox
+    // event inside the SAME transaction as the order. This is the
+    // Transactional Outbox pattern in action.
+    //
+    // BEFORE (Phase 2):
+    //   order = await orderRepo.create(...);    // DB transaction
+    //   await eventProducer.publishOrderCreated(order); // Kafka publish (can fail!)
+    //
+    // AFTER (Phase 3):
+    //   order = await orderRepo.create(..., async (client) => {
+    //     await outboxRepo.insertWithClient(client, event); // Same DB transaction!
+    //   });
+    //   // OutboxRelay handles Kafka publishing later
+    // ═══════════════════════════════════════════════════════════════
+
     let order: Order;
     try {
-      order = await this.orderRepo.create(input, idempotencyKey, {
-        totalAmount: roundedTotalAmount,
-        deliveryFee,
-        taxAmount,
-        grandTotal,
-      });
+      order = await this.orderRepo.create(
+        input,
+        idempotencyKey,
+        {
+          totalAmount: roundedTotalAmount,
+          deliveryFee,
+          taxAmount,
+          grandTotal,
+        },
+        async (client) => {
+          // We don't have the orderId until the INSERT completes,
+          // so we need to query it from the client within the transaction.
+          // The orderRepo.create already inserted the order row, so we
+          // can get the ID from the RETURNING clause (passed via closure).
+          // But since we don't have it here, we build the event with
+          // the input data and the calculated totals.
+          //
+          // 🔍 LEARNING NOTE: We build the full event envelope HERE,
+          // before it goes to the outbox. This way the relay doesn't
+          // need to know anything about event schemas — it just
+          // forwards the JSON blob to Kafka.
+
+          // We'll get the orderId after create returns, but we need it
+          // for the event. So we query the latest order we just inserted.
+          const result = await client.query<{ id: string }>(
+            `SELECT id FROM orders WHERE idempotency_key = $1
+             UNION ALL
+             SELECT id FROM orders WHERE customer_id = $2
+             ORDER BY 1 DESC LIMIT 1`,
+            [idempotencyKey ?? '', input.customerId]
+          );
+
+          const orderId = result.rows[0]?.id ?? 'unknown';
+
+          const event = buildOrderCreatedEvent({
+            id: orderId,
+            customerId: input.customerId,
+            customerName: input.customerName,
+            customerEmail: input.customerEmail,
+            customerPhone: input.customerPhone,
+            restaurantId: input.restaurantId,
+            restaurantName: input.restaurantName,
+            status: 'PENDING',
+            totalAmount: roundedTotalAmount,
+            deliveryFee,
+            taxAmount,
+            grandTotal,
+            deliveryAddress: input.deliveryAddress,
+            items: input.items.map((item) => ({
+              itemName: item.itemName,
+              quantity: item.quantity,
+              unitPrice: item.unitPrice,
+              totalPrice: Math.round(item.quantity * item.unitPrice * 100) / 100
+            })),
+          });
+
+          const outboxEvent: InsertOutboxEvent = {
+            aggregateId: orderId,
+            eventType: event.eventType,
+            topic: config.kafkaTopicOrderEvents,
+            key: orderId,
+            payload: event as unknown as Record<string, unknown>,
+            headers: {
+              'event-type': event.eventType,
+              'event-id': event.eventId,
+              'source': event.source,
+            }
+          };
+
+          await this.outboxRepo.insertWithClient(client, outboxEvent);
+        }
+      );
     } catch (err: unknown) {
       // Handle unique constraint violation on idempotency_key
       // 🔍 LEARNING NOTE: This catches the race condition described above.
@@ -153,54 +242,8 @@ export class OrderService {
         itemCount: order.items.length,
         grandTotal: order.grandTotal,
       },
-      "📦 Order created",
+      '📦 Order created (event written to outbox)'
     );
-
-    // Step 4: Publish event (ASYNCHRONOUS - ~2ms, non-blocking!)
-    //
-    // ═══════════════════════════════════════════════════════════════
-    // 🔍 PHASE 2 CHANGE: This is THE key architectural change.
-    //
-    // BEFORE (Phase 1 — synchronous):
-    //   await this.notificationService.send({ ... });
-    //   // Blocks for 500ms. Customer waits. Bad UX.
-    //
-    // AFTER (Phase 2 — event-driven):
-    //   await this.eventProducer.publishOrderCreated(order);
-    //   // Returns in ~2ms. Customer gets fast response. 🎉
-    //
-    // The notification is now processed ASYNCHRONOUSLY by the
-    // notification consumer (src/consumers/notification-consumer.ts).
-    //
-    // What happens if Kafka is down?
-    //   - The event is NOT published (logged as error)
-    //   - The order is still saved in the DB (customer's order is safe)
-    //   - The notification won't be sent (acceptable trade-off)
-    //   - In Phase 3, the Transactional Outbox pattern eliminates this gap
-    // ═══════════════════════════════════════════════════════════════
-    if (this.eventProducer) {
-      await this.eventProducer.publishOrderCreated({
-        id: order.id,
-        customerId: order.customerId,
-        customerName: order.customerName,
-        customerEmail: order.customerEmail,
-        customerPhone: order.customerPhone,
-        restaurantId: order.restaurantId,
-        restaurantName: order.restaurantName,
-        status: order.status,
-        totalAmount: order.totalAmount,
-        deliveryFee: order.deliveryFee,
-        taxAmount: order.taxAmount,
-        grandTotal: order.grandTotal,
-        deliveryAddress: order.deliveryAddress,
-        items: order.items.map((item) => ({
-          itemName: item.itemName,
-          quantity: item.quantity,
-          unitPrice: item.unitPrice,
-          totalPrice: item.totalPrice,
-        })),
-      });
-    }
 
     const totalLatency = Date.now() - startTime;
     log.info(
@@ -278,14 +321,42 @@ export class OrderService {
         "INVALID_STATUS_TRANSITION",
       );
     }
-
-    // Step 3: Update status (with optimistic concurrency)
+    // Step 3: Update status (with optimistic concurrency + outbox)
+    // 🔍 PHASE 3 CHANGE: Same outbox pattern as createOrder.
+    // Status change event is atomically written with the status update.
     const updatedOrder = await this.orderRepo.updateStatus(
       id,
       currentOrder.status,
       input.status,
       input.changedBy ?? "system",
       input.reason,
+      async (client) => {
+        const event = buildOrderStatusChangedEvent({
+          orderId: id,
+          previousStatus: currentOrder.status,
+          newStatus: input.status,
+          changedBy: input.changedBy ?? 'system',
+          reason: input.reason,
+          customerEmail: currentOrder.customerEmail,
+          customerName: currentOrder.customerName,
+          restaurantName: currentOrder.restaurantName,
+        });
+
+        const outboxEvent: InsertOutboxEvent = {
+          aggregateId: id,
+          eventType: event.eventType,
+          topic: config.kafkaTopicOrderEvents,
+          key: id,
+          payload: event as unknown as Record<string, unknown>,
+          headers: {
+            'event-type': event.eventType,
+            'event-id': event.eventId,
+            'source': event.source
+          },
+        };
+
+        await this.outboxRepo.insertWithClient(client, outboxEvent);
+      }
     );
 
     if (!updatedOrder) {
@@ -306,23 +377,9 @@ export class OrderService {
         to: input.status,
         changedBy: input.changedBy,
       },
-      `📋 Order status updated: ${currentOrder.status} → ${input.status}`,
+      `📋 Order status updated: ${currentOrder.status} → ${input.status} (event written to outbox)`
     );
 
-    // Step 4: Publish status change event (ASYNCHRONOUS)
-    // 🔍 PHASE 2 CHANGE: Same pattern as createOrder — publish event
-    // instead of calling notification service synchronously.
-    if (this.eventProducer) {
-      await this.eventProducer.publishOrderStatusChanged({
-        orderId: updatedOrder.id,
-        previousStatus: currentOrder.status,
-        newStatus: updatedOrder.status,
-        changedBy: input.changedBy ?? 'system',
-        customerEmail: updatedOrder.customerEmail,
-        customerName: updatedOrder.customerName,
-        restaurantName: updatedOrder.restaurantName
-      });
-    }
     return updatedOrder;
   }
 

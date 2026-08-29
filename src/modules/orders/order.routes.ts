@@ -22,16 +22,17 @@ import { OrderStatusType } from "./order.types";
 import { createModuleLogger } from "../../shared/logger";
 import { ApiError, ApiResponse } from "../../types/index.js";
 import { Order, OrderStatusHistoryEntry } from "../orders/order.types.js";
-import { EventProducer } from "../../kafka/producer.js";
 
 const log = createModuleLogger("order-routes");
 
 export async function registerOrderRoutes(
   app: FastifyInstance,
-  pool: Pool,
-  eventProducer: EventProducer | null = null,
+  pool: Pool
 ): Promise<void> {
-  const orderService = new OrderService(pool, eventProducer);
+  // 🔍 PHASE 3 CHANGE: OrderService no longer needs a Kafka producer.
+  // Events are written to the outbox table atomically with orders.
+  // The OutboxRelay (running in the API process) handles Kafka publishing.
+  const orderService = new OrderService(pool);
 
   // ─────────────────────────────────────────────────
   // POST /api/v1/orders — Create Order

@@ -129,39 +129,30 @@ export class NotificationConsumerHandler implements MessageHandler {
             grandTotal: order.grandTotal,
         });
 
-        try {
-            await this.notificationService.send({
-                orderId: order.id,
-                type: 'ORDER_CONFIRMED',
-                channel: 'EMAIL',
-                recipient: order.customerEmail,
-                subject,
-                content
-            });
+        // 🔍 PHASE 3 CHANGE: We NO LONGER catch errors here.
+        // Errors propagate up to the KafkaConsumer's withRetry() wrapper,
+        // which handles retry with exponential backoff → DLQ on exhaustion.
+        //
+        // BEFORE (Phase 2): catch → log → swallow → notification LOST
+        // AFTER  (Phase 3): throw → withRetry catches → retry 3x → DLQ if all fail
+        await this.notificationService.send({
+            orderId: order.id,
+            type: 'ORDER_CONFIRMED',
+            channel: 'EMAIL',
+            recipient: order.customerEmail,
+            subject,
+            content
+        });
 
-            const latency = Date.now() - startTime;
-            log.info(
-                {
-                    orderId: order.id,
-                    eventId: event.eventId,
-                    latencyMs: latency,
-                },
-                `✉️  Order confirmation sent for ${order.id} (${latency}ms)`
-            );
-        } catch (err) {
-            // 🔍 LEARNING NOTE: If notification fails, we log it but DON'T rethrow.
-            // The consumer will commit the offset and move on.
-            //
-            // This means the notification is LOST. In Phase 3, we'll add:
-            // 1. Retry logic (try again with backoff)
-            // 2. Dead Letter Queue (store failed events for investigation)
-            // 3. Notification status tracking (PENDING → SENT / FAILED)
-            const latency = Date.now() - startTime;
-            log.error(
-                { err, orderId: order.id, eventId: event.eventId, latencyMs: latency },
-                `❌ Failed to send notification for order ${order.id}`
-            );
-        }
+        const latency = Date.now() - startTime;
+        log.info(
+            {
+                orderId: order.id,
+                eventId: event.eventId,
+                latencyMs: latency,
+            },
+            `✉️  Order confirmation sent for ${order.id} (${latency}ms)`
+        );
     }
 
     // ─────────────────────────────────────────────────
@@ -179,32 +170,25 @@ export class NotificationConsumerHandler implements MessageHandler {
             status: newStatus,
         })
 
-        try {
-            await this.notificationService.send({
-                orderId,
-                type: newStatus === 'CANCELLED' ? 'ORDER_CANCELLED' : 'ORDER_STATUS_CHANGED',
-                channel: 'EMAIL',
-                recipient: customerEmail,
-                subject,
-                content
-            });
+        // 🔍 PHASE 3 CHANGE: Same as above — let errors propagate for retry+DLQ.
+        await this.notificationService.send({
+            orderId,
+            type: newStatus === 'CANCELLED' ? 'ORDER_CANCELLED' : 'ORDER_STATUS_CHANGED',
+            channel: 'EMAIL',
+            recipient: customerEmail,
+            subject,
+            content,
+        });
 
-            const latency = Date.now() - startTime;
-            log.info(
-                {
-                    orderId,
-                    eventId: event.eventId,
-                    newStatus,
-                    latencyMs: latency,
-                },
-                `✉️  Status notification sent: ${newStatus} for ${orderId} (${latency}ms)`
-            );
-        } catch (err) {
-            const latency = Date.now() - startTime;
-            log.error(
-                { err, orderId, eventId: event.eventId, newStatus, latencyMs: latency },
-                `❌ Failed to send status notification for order ${orderId}`
-            );
-        }
+        const latency = Date.now() - startTime;
+        log.info(
+            {
+                orderId,
+                eventId: event.eventId,
+                newStatus,
+                latencyMs: latency,
+            },
+            `✉️  Status notification sent: ${newStatus} for ${orderId} (${latency}ms)`
+        );
     }
 }

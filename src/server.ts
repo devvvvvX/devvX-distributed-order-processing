@@ -25,9 +25,8 @@ import { registerOrderRoutes } from "./modules/orders/order.routes.js";
 import { registerHealthRoutes } from "./shared/health.js";
 import { AppError } from "./shared/errors.js";
 import { ApiResponse } from "./types/index.js";
-import { EventProducer } from "./kafka/producer.js";
 
-export async function buildServer(pool: Pool, eventProducer: EventProducer | null = null): Promise<FastifyInstance> {
+export async function buildServer(pool: Pool): Promise<FastifyInstance> {
   // 🔍 LEARNING NOTE: In Fastify v5, the `logger` option only accepts a
   // plain config object — you cannot pass a Pino instance directly.
   // If you need a shared Pino instance elsewhere (e.g. for DB or queue
@@ -191,7 +190,7 @@ export async function buildServer(pool: Pool, eventProducer: EventProducer | nul
   // ─────────────────────────────────────────────────
 
   await registerHealthRoutes(app, pool);
-  await registerOrderRoutes(app, pool, eventProducer);
+  await registerOrderRoutes(app, pool);
 
   return app;
 }

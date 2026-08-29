@@ -1,34 +1,47 @@
 // ============================================================
-// Kafka Consumer — Processing Events
+// Kafka Consumer — Reliable Event Processing (Phase 3)
 // ============================================================
-// 🔍 LEARNING NOTE: Kafka consumers are fundamentally different from
-// HTTP request handlers. Key differences:
+// 🔍 LEARNING NOTE: This is the Phase 3 evolution of the consumer.
+// Phase 2 consumer was simple: process message → commit offset.
+// If processing failed, we logged and skipped. Events could be lost.
 //
-// HTTP (Phase 1):
-//   - Request arrives → process → respond → done
-//   - Stateless: each request is independent
-//   - If the server crashes, the client retries
+// Phase 3 adds THREE layers of reliability:
 //
-// Kafka Consumer (Phase 2):
-//   - Consumer POLLS for messages in a loop
-//   - Consumer maintains STATE (offset = where am I in the log?)
-//   - If the consumer crashes, it restarts from its last committed offset
-//   - Messages are NOT deleted after consumption (unlike RabbitMQ)
-//   - Multiple consumers in a GROUP share the work (Phase 3)
+// 1. IDEMPOTENCY (processed_events table):
+//    Before processing, check if we've seen this eventId before.
+//    This prevents duplicate processing when Kafka re-delivers events
+//    (consumer crash, rebalance, outbox re-publish).
 //
-// OFFSET MANAGEMENT is the most critical concept:
-//   - Each partition has an OFFSET counter (0, 1, 2, 3, ...)
-//   - The consumer tracks "I've processed up to offset 42"
-//   - On restart, it resumes from offset 42
-//   - COMMIT = persist the current offset to Kafka
-//   - If you commit BEFORE processing → message lost on crash
-//   - If you commit AFTER processing → message re-processed on crash
-//   - We commit AFTER → at-least-once delivery (safe default)
-
+// 2. RETRY WITH BACKOFF (exponential + jitter):
+//    If processing fails (e.g., email API timeout), retry with
+//    increasing delays. Transient failures often self-heal.
+//
+// 3. DEAD LETTER QUEUE (DLQ):
+//    If all retries fail, publish to a DLQ topic for investigation
+//    instead of losing the event forever.
+//
+// PROCESSING FLOW (Phase 3):
+//   1. Receive message from Kafka
+//   2. Deserialize event envelope → extract eventId
+//   3. Check processed_events: already processed? → SKIP
+//   4. Call handler.handle() with retry wrapper
+//      - Success → mark as processed, commit offset
+//      - All retries fail → publish to DLQ, commit offset
+//   5. Commit offset (event is either processed or in DLQ)
+//
+// This provides AT-LEAST-ONCE processing with IDEMPOTENT deduplication:
+// - Events may be delivered more than once (at-least-once transport)
+// - Idempotency prevents duplicate business effects
+// - Retry + DLQ ensures failed events are durably preserved
+// - Combined: effectively once-per-event within our DB transaction guarantees
 
 import { Kafka, Consumer, EachMessagePayload } from 'kafkajs';
 import { config } from '../config';
-import { createModuleLogger } from '../shared/logger';
+import { createModuleLogger } from '../shared/logger.js';
+import { IdempotencyStore } from './idempotency.js';
+import { DlqProducer } from './dlq-producer.js';
+import { withRetry } from './retry.js';
+import { deserializeEvent } from './events.js';
 
 const log = createModuleLogger('kafka-consumer');
 
@@ -40,33 +53,49 @@ export class KafkaConsumer {
     private consumer: Consumer;
     private connected = false;
 
-    constructor(kafka: Kafka) {
+    constructor(
+        kafka: Kafka,
+        private readonly idempotencyStore: IdempotencyStore,
+        private readonly dlqProducer: DlqProducer
+    ) {
         this.consumer = kafka.consumer({
             groupId: config.kafkaConsumerGroupId,
 
             // 🔍 LEARNING NOTE: Session timeout and heartbeat interval.
             //
-            // The consumer sends HEARTBEATS to Kafka to prove it's alive.
-            // If Kafka doesn't receive a heartbeat within sessionTimeout,
-            // it considers the consumer DEAD and reassigns its partitions
-            // to other consumers in the group (REBALANCING — Phase 3 deep dive).
+            // Phase 3 CRITICAL INSIGHT — Consumer Groups and Rebalancing:
             //
-            // Heartbeat interval should be < 1/3 of session timeout.
-            // If your message processing takes longer than sessionTimeout,
-            // Kafka thinks you're dead and rebalances — causing duplicate
-            // processing. This is a common production issue.
-
+            // When you run MULTIPLE consumers with the same groupId,
+            // Kafka forms a CONSUMER GROUP. Kafka assigns each partition
+            // to exactly ONE consumer in the group.
+            //
+            // With 3 partitions and 3 consumers:
+            //   Consumer-1 → Partition 0
+            //   Consumer-2 → Partition 1
+            //   Consumer-3 → Partition 2
+            //
+            // If Consumer-2 dies (no heartbeat for sessionTimeout):
+            //   Kafka triggers a REBALANCE:
+            //   Consumer-1 → Partition 0, Partition 1  (picked up the orphan)
+            //   Consumer-3 → Partition 2
+            //
+            // When Consumer-2 comes back:
+            //   Another rebalance:
+            //   Consumer-1 → Partition 0
+            //   Consumer-2 → Partition 1  (back to normal)
+            //   Consumer-3 → Partition 2
+            //
+            // REBALANCING IS EXPENSIVE:
+            //   - All consumers stop processing during rebalance
+            //   - All uncommitted progress is lost (messages re-delivered)
+            //   - Can take several seconds
+            //
+            // That's why idempotency is essential — rebalancing CAUSES duplicates.
             sessionTimeout: 30000,   // 30 seconds
             heartbeatInterval: 3000, // 3 seconds
 
-            // 🔍 LEARNING NOTE: maxWaitTimeInMs controls how long the
-            // consumer waits for new messages before returning an empty
-            // poll response. Lower = more responsive, higher = fewer network calls.
             maxWaitTimeInMs: 5000,
 
-            // 🔍 LEARNING NOTE: retry config for the consumer itself.
-            // If the broker is temporarily unreachable, KafkaJS retries
-            // with exponential backoff before giving up.
             retry: {
                 initialRetryTime: 300,
                 retries: 10,
@@ -88,39 +117,12 @@ export class KafkaConsumer {
                 '✅ Kafka consumer connected'
             );
 
-            // Subscribe to topic
-            // 🔍 LEARNING NOTE: fromBeginning=true means "if this consumer
-            // group has never consumed this topic before, start from offset 0"
-            // (the oldest available message). If false, it starts from the
-            // latest offset (only new messages).
-            //
-            // For the notification consumer, we want fromBeginning=true so
-            // we don't miss any events that were published before the consumer
-            // started for the first time.
-            //
-            // After the first run, the consumer group's committed offset
-            // determines where to resume, regardless of this setting.
-
             await this.consumer.subscribe({
                 topic,
                 fromBeginning: true
             });
 
             log.info({ topic }, `📥 Subscribed to topic: ${topic}`);
-
-            // Start consuming messages
-            // 🔍 LEARNING NOTE: eachMessage processes ONE message at a time.
-            // KafkaJS also offers eachBatch for higher throughput (process
-            // multiple messages before committing). We use eachMessage because:
-            // 1. Simpler error handling (one message at a time)
-            // 2. Better for learning (see each message's lifecycle)
-            // 3. Sufficient for our throughput needs
-            //
-            // autoCommit=false means WE control when offsets are committed.
-            // This is critical for at-least-once delivery:
-            // - Process message → commit offset → done
-            // - If we crash between process and commit → message re-delivered ✅
-            // - If we commit before processing → message lost on crash ❌
 
             await this.consumer.run({
                 autoCommit: false,
@@ -131,42 +133,133 @@ export class KafkaConsumer {
                     const startTime = Date.now();
 
                     try {
+                        // ─── Step 1: Extract eventId for idempotency ───
+                        // 🔍 LEARNING NOTE: We try to get the eventId from the message
+                        // headers first (fast, no deserialization needed), then fall
+                        // back to deserializing the event body. Headers were set by
+                        // the producer/outbox relay.
+                        let eventId = message.headers?.['event-id']?.toString();
+
+                        if (!eventId && message.value) {
+                            try {
+                                const event = deserializeEvent(message.value.toString());
+                                eventId = event.eventId;
+                            } catch (err) {
+                                // Can't deserialize — we'll let the handler deal with it
+                            }
+                        }
+
+                        // ─── Step 2: Idempotency check ───
+                        if (eventId) {
+                            const alreadyProcessed = await this.idempotencyStore.hasBeenProcessed(eventId, config.kafkaConsumerGroupId);
+                            if (alreadyProcessed) {
+                                log.debug(
+                                    { eventId, partition, offset },
+                                    `⏭️  Event already processed — skipping (idempotent)`
+                                );
+
+                                // Commit offset to advance past this duplicate
+                                await this.consumer.commitOffsets([
+                                    {
+                                        topic: msgTopic,
+                                        partition,
+                                        offset: (BigInt(offset) + 1n).toString(),
+                                    }
+                                ])
+                                return;
+                            }
+                        }
+
+                        // ─── Step 3: Process with retry ───
                         log.debug(
-                            { topic: msgTopic, partition, offset, key },
+                            { topic: msgTopic, partition, offset, key, eventId },
                             `📩 Processing message: partition=${partition} offset=${offset}`
                         );
 
-                        // Delegate to the handler (notification consumer logic)
-                        await handler.handle(payload);
-
-                        // 🔍 LEARNING NOTE: Commit offset AFTER successful processing.
-                        // The "+1" is because Kafka expects the NEXT offset to read,
-                        // not the offset that was just processed.
-                        await this.consumer.commitOffsets([
+                        const retryResult = await withRetry(
+                            () => handler.handle(payload),
                             {
-                                topic: msgTopic,
-                                partition,
-                                offset: (BigInt(offset) + 1n).toString(),
-                            }
-                        ]);
-
-                        const latency = Date.now() - startTime;
-                        log.debug(
-                            { topic: msgTopic, partition, offset, latencyMs: latency },
-                            `✅ Message processed and committed (${latency}ms)`
+                                maxRetries: config.consumerMaxRetries,
+                                baseDelayMs: config.consumerRetryBaseDelayMs
+                            },
+                            { topic: msgTopic, partition, offset, key, eventId }
                         );
+
+                        if (retryResult.success) {
+                            // ─── Step 4a: Mark as processed (success) ───
+                            if (eventId) {
+                                await this.idempotencyStore.markAsProcessed(eventId, config.kafkaConsumerGroupId);
+                            }
+
+                            // Commit offset
+                            await this.consumer.commitOffsets([
+                                {
+                                    topic: msgTopic,
+                                    partition,
+                                    offset: (BigInt(offset) + 1n).toString(),
+                                },
+                            ]);
+
+                            const latency = Date.now() - startTime;
+                            log.debug(
+                                {
+                                    topic: msgTopic, partition, offset,
+                                    latencyMs: latency, attempts: retryResult.attempts,
+                                },
+                                `✅ Message processed and committed (${latency}ms, ${retryResult.attempts} attempt(s))`
+                            );
+                        } else {
+                            // ─── Step 4b: Send to DLQ (all retries exhausted) ───
+
+                            const latency = Date.now() - startTime;
+                            log.error(
+                                {
+                                    topic: msgTopic, partition, offset, key, eventId,
+                                    latencyMs: latency,
+                                    error: retryResult.lastError?.message,
+                                },
+                                `☠️  All retries exhausted — sending to DLQ`
+                            );
+
+                            await this.dlqProducer.sendToDlq({
+                                originalTopic: msgTopic,
+                                originalPartition: partition,
+                                originalOffset: offset,
+                                originalKey: key ?? null,
+                                originalValue: message.value?.toString() ?? null,
+                                errorMessage: retryResult.lastError?.message ?? 'Unknown error',
+                                errorStack: retryResult.lastError?.stack,
+                                retryCount: retryResult.attempts,
+                                failedAt: new Date().toISOString(),
+                                consumerGroup: config.kafkaConsumerGroupId
+                            });
+
+                            // Mark as processed (in DLQ) to prevent re-processing
+                            if (eventId) {
+                                await this.idempotencyStore.markAsProcessed(eventId, config.kafkaConsumerGroupId);
+                            }
+
+                            // Commit offset to move past the failed message
+                            // 🔍 LEARNING NOTE: We commit the offset even for DLQ'd messages.
+                            // The event is now in the DLQ — it's not lost. If we didn't
+                            // commit, the consumer would re-process (and re-DLQ) this
+                            // message on every restart, creating an infinite DLQ loop.
+                            await this.consumer.commitOffsets([
+                                {
+                                    topic: msgTopic,
+                                    partition,
+                                    offset: (BigInt(offset) + 1n).toString(),
+                                },
+                            ]);
+
+                        }
                     } catch (err) {
+                        // 🔍 LEARNING NOTE: This outer catch handles unexpected errors
+                        // (e.g., idempotency store is down, DLQ producer is down).
+                        // These are infrastructure failures, not business failures.
+                        // We log and commit to prevent infinite loops.
                         const latency = Date.now() - startTime;
 
-                        // 🔍 LEARNING NOTE: We catch errors PER MESSAGE so one bad
-                        // message doesn't crash the entire consumer. This is the
-                        // "poison pill" defense.
-                        //
-                        // Without this catch, a single malformed event would crash
-                        // the consumer, blocking ALL subsequent events in the partition.
-                        //
-                        // In Phase 3, we'll send failed messages to a Dead Letter Queue
-                        // (DLQ) for manual investigation instead of just logging them.
 
                         log.error(
                             {
@@ -177,12 +270,10 @@ export class KafkaConsumer {
                                 key,
                                 latencyMs: latency,
                             },
-                            `❌ Error processing message — skipping`
+                            `❌ Unexpected error in consumer pipeline — skipping`
                         );
 
-                        // Commit the offset anyway to skip the bad message
-                        // 🔍 LEARNING NOTE: This means the bad message is lost.
-                        // In Phase 3, we'll publish it to a DLQ before skipping.
+                        // Commit the offset to prevent infinite reprocessing
                         await this.consumer.commitOffsets([
                             {
                                 topic: msgTopic,
@@ -202,18 +293,6 @@ export class KafkaConsumer {
     // ─────────────────────────────────────────────────
     // Graceful shutdown
     // ─────────────────────────────────────────────────
-    // 🔍 LEARNING NOTE: Consumer shutdown is MORE complex than HTTP shutdown.
-    //
-    // Steps:
-    // 1. Stop fetching new messages
-    // 2. Wait for current message processing to complete
-    // 3. Commit final offsets (so we don't re-process on restart)
-    // 4. Disconnect from Kafka (triggers consumer group rebalance)
-    //
-    // If we skip step 3, the consumer restarts and re-processes messages
-    // from the last committed offset → duplicate notifications.
-    // If we skip step 4, Kafka doesn't know we've left the group until
-    // sessionTimeout expires (30 seconds of partition limbo).
     async stop(): Promise<void> {
         if (!this.connected) return;
 
