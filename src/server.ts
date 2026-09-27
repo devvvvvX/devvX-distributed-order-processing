@@ -20,13 +20,18 @@
 import Fastify, { FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
 import { Pool } from "pg";
+import Redis from 'ioredis';
 import { config } from "./config/index.js";
 import { registerOrderRoutes } from "./modules/orders/order.routes.js";
 import { registerHealthRoutes } from "./shared/health.js";
 import { AppError } from "./shared/errors.js";
 import { ApiResponse } from "./types/index.js";
+import { createRateLimiter } from "./middleware/rate-limiter.js";
 
-export async function buildServer(pool: Pool): Promise<FastifyInstance> {
+export async function buildServer(
+  pool: Pool,
+  redis: Redis | null = null
+): Promise<FastifyInstance> {
   // 🔍 LEARNING NOTE: In Fastify v5, the `logger` option only accepts a
   // plain config object — you cannot pass a Pino instance directly.
   // If you need a shared Pino instance elsewhere (e.g. for DB or queue
@@ -112,6 +117,21 @@ export async function buildServer(pool: Pool): Promise<FastifyInstance> {
     );
   });
 
+  // 🔍 PHASE 4 ADDITION: Rate limiting via Redis.
+  // This hook runs BEFORE route handlers, rejecting excessive requests
+  // with 429 before they touch the database.
+  // The rate limiter falls OPEN on Redis failure — we never let Redis
+  // downtime break the API.
+  if (redis) {
+    const rateLimiter = createRateLimiter(redis);
+    app.addHook('onRequest', async (request, reply) => {
+      // Skip rate limiting for health checks — monitoring tools
+      // poll /health frequently and shouldn't be rate-limited.
+      if (request.url === '/health') return;
+      await rateLimiter(request, reply);
+    })
+  }
+
   // Log response with timing
   app.addHook("onResponse", async (request, reply) => {
     request.log.info(
@@ -189,8 +209,8 @@ export async function buildServer(pool: Pool): Promise<FastifyInstance> {
   // Routes
   // ─────────────────────────────────────────────────
 
-  await registerHealthRoutes(app, pool);
-  await registerOrderRoutes(app, pool);
+  await registerHealthRoutes(app, pool, redis);
+  await registerOrderRoutes(app, pool, redis);
 
   return app;
 }

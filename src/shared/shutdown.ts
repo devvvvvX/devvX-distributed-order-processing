@@ -1,34 +1,23 @@
 // ============================================================
-// Graceful Shutdown (Phase 3: + Outbox Relay)
+// Graceful Shutdown (Phase 4: + Redis + Leader Election)
 // ============================================================
 // 🔍 LEARNING NOTE: Graceful shutdown is one of the most important
 // production patterns, and one of the most commonly overlooked.
 //
-// What happens WITHOUT graceful shutdown:
-// 1. Kubernetes sends SIGTERM to your pod during a rolling deploy
-// 2. Your process immediately exits (process.exit or unhandled signal)
-// 3. All in-flight HTTP requests get TCP RST (connection reset)
-// 4. Customers see "connection refused" or partial responses
-// 5. Database transactions are left half-committed
-// 6. You get paged at 3 AM
+// 🔍 PHASE 4 EVOLUTION:
+// Added leader election and Redis to the shutdown sequence.
+// Shutdown order (reverse of startup):
+//   1. HTTP server → stop accepting new connections
+//   2. Leader election → release leadership (follower takes over relay)
+//   3. Outbox relay → stop polling, flush in-progress batch
+//   4. Kafka producer → flush pending events
+//   5. Redis → disconnect
+//   6. DB pool → close connections
 //
-// What happens WITH graceful shutdown:
-// 1. SIGTERM received
-// 2. Stop accepting NEW connections (server.close())
-// 3. Wait for in-flight requests to complete (with timeout)
-// 4. Stop outbox relay (flush any in-progress batch)
-// 5. Close database connections cleanly
-// 6. Exit with code 0
-//
-// 🔍 PHASE 3 EVOLUTION:
-// Added OutboxRelay to the shutdown sequence. The relay must stop
-// BEFORE the Kafka producer disconnects, because it uses the producer
-// to publish events. And the producer must disconnect BEFORE the DB
-// pool closes, because the relay reads from the DB.
-//
-// Shutdown order:
-//   HTTP server → Outbox relay → Kafka producer → DB pool
-// (reverse of startup order — a general best practice)
+// The leader election MUST be stopped BEFORE the outbox relay,
+// because releasing leadership triggers the relay stop callback.
+// Redis MUST be disconnected AFTER leader election stops (it needs
+// Redis to release the lease).
 
 import { FastifyInstance } from "fastify";
 import { Pool } from "pg";
@@ -36,6 +25,8 @@ import { createModuleLogger } from "./logger.js";
 import { config } from "../config";
 import { EventProducer } from "../kafka/producer.js";
 import { OutboxRelay } from "../outbox/outbox-relay.js";
+import { LeaderElection } from "../redis/leader-election.js";
+import { disconnectRedis } from "../redis/client.js";
 
 const log = createModuleLogger("shutdown");
 
@@ -43,7 +34,8 @@ export function setupGracefulShutdown(
   app: FastifyInstance,
   pool: Pool,
   eventProducer: EventProducer | null = null,
-  outboxRelay: OutboxRelay | null = null
+  outboxRelay: OutboxRelay | null = null,
+  leaderElection: LeaderElection | null = null
 ): void {
   let isShuttingDown = false;
 
@@ -78,17 +70,25 @@ export function setupGracefulShutdown(
       await app.close();
       log.info("✅ HTTP server closed");
 
-      // Step 2: Stop outbox relay (wait for in-progress batch)
-      // 🔍 PHASE 3 ADDITION: Stop the relay BEFORE disconnecting
-      // the Kafka producer, because the relay needs the producer
-      // to finish publishing any in-progress batch.
+      // Step 2: Stop leader election (releases lease → follower takes over)
+      // 🔍 PHASE 4 ADDITION: This must happen BEFORE stopping the relay.
+      // Releasing the lease tells other instances they can become leader.
+      // The onLoseLeadership callback will stop the relay.
+      if (leaderElection) {
+        log.info('Stopping leader election...');
+        await leaderElection.stop();
+        log.info('✅ Leader election stopped');
+      }
+
+      // Step 3: Stop outbox relay (if still running - might already be stopped
+      // be stopped by leadership loss callback)
       if (outboxRelay) {
-        log.info('Stop outbox relay...');
+        log.info('Stopping outbox relay...');
         await outboxRelay.stop();
         log.info('✅ Outbox relay stopped');
       }
 
-      // Step 3: Disconnect Kafka producer (flush pending events)
+      // Step 4: Disconnect Kafka producer (flush pending events)
       // 🔍 LEARNING NOTE: The producer's disconnect() flushes its
       // internal buffer, ensuring no events are lost. This must happen
       // BEFORE closing the DB pool because the producer might still
@@ -99,7 +99,13 @@ export function setupGracefulShutdown(
         log.info('✅ Kafka producer disconnected');
       }
 
-      // Step 4: Close database pool
+      // Step 5: Disconnect Redis
+      // 🔍 PHASE 4 ADDITION: Redis disconnect must happen AFTER
+      // leader election stops (it needs Redis to release the lease).
+      log.info('Disconnecting Redis...');
+      await disconnectRedis();
+
+      // Step 6: Close database pool
       // This waits for active queries to finish, then closes connections.
       log.info("Closing database pool...");
       await pool.end();
