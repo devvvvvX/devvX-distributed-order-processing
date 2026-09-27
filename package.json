@@ -2,17 +2,18 @@
   "name": "order-platform",
   "version": "1.0.0",
   "description": "Real-Time Distributed Order Processing Platform — Phase 1: Monolith",
-  "main": "dest/index.js",
+  "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "typeCheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@fastify/cors": "^11.2.0",
     "dotenv": "^17.4.2",
     "fastify": "^5.10.0",
+    "ioredis": "^5.11.1",
     "kafkajs": "^2.2.4",
     "pg": "^8.22.0",
     "pino": "^10.3.1",

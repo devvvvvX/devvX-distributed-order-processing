@@ -59,6 +59,34 @@ const configSchema = z.object({
     outboxPollIntervalMs: z.coerce.number().int().min(100).default(1000),
     outboxBatchSize: z.coerce.number().int().min(1).default(50),
 
+    // Redis (Phase 4)
+    // 🔍 LEARNING NOTE: Redis connection URL. Format: redis://[password@]host:port[/db]
+    // Default to empty string — Redis is optional. The app gracefully degrades
+    // without it (rate limiter falls open, cache misses go to DB, no leader election).
+    redisUrl: z.string().default(''),
+    redisKeyPrefix: z.string().default('op:'),
+
+    // Rate Limiting (Phase 4)
+    // 🔍 LEARNING NOTE: Sliding window rate limiter using Redis.
+    // Without rate limiting, a single abusive client can overwhelm the API
+    // and affect all other customers. Rate limits are the first line of defense.
+    rateLimitWindowMs: z.coerce.number().int().min(1000).default(60000),
+    rateLimitMaxRequests: z.coerce.number().int().min(1).default(30),
+
+    // Cache (Phase 4)
+    // 🔍 LEARNING NOTE: Cache TTL controls the staleness vs freshness tradeoff.
+    // Higher TTL = fewer DB queries but staler data.
+    // Lower TTL = fresher data but more DB queries.
+    // 60 seconds is a good balance for order data.
+    cacheOrderTtlSeconds: z.coerce.number().int().min(1).default(60),
+
+    // Leader Election (Phase 4)
+    // 🔍 LEARNING NOTE: The leader lease must be longer than the heartbeat interval.
+    // If the leader misses ONE heartbeat, it should NOT lose leadership.
+    // Rule of thumb: lease TTL = 3x heartbeat (survives brief network blips).
+    leaderElectionLeaseTtlMs: z.coerce.number().int().min(1000).default(15000),
+    leaderElectionHeartbeatMs: z.coerce.number().int().min(500).default(5000),
+
     // Graceful Shutdown
     shutdownTimeoutMs: z.coerce.number().int().positive().default(10000),
 });
@@ -87,6 +115,13 @@ function loadConfig(): Config {
         consumerRetryBaseDelayMs: process.env['CONSUMER_RETRY_BASE_DELAY_MS'],
         outboxPollIntervalMs: process.env['OUTBOX_POLL_INTERVAL_MS'],
         outboxBatchSize: process.env['OUTBOX_BATCH_SIZE'],
+        redisUrl: process.env['REDIS_URL'],
+        redisKeyPrefix: process.env['REDIS_KEY_PREFIX'],
+        rateLimitWindowMs: process.env['RATE_LIMIT_WINDOW_MS'],
+        rateLimitMaxRequests: process.env['RATE_LIMIT_MAX_REQUESTS'],
+        cacheOrderTtlSeconds: process.env['CACHE_ORDER_TTL_SECONDS'],
+        leaderElectionLeaseTtlMs: process.env['LEADER_ELECTION_LEASE_TTL_MS'],
+        leaderElectionHeartbeatMs: process.env['LEADER_ELECTION_HEARTBEAT_MS'],
         shutdownTimeoutMs: process.env['SHUTDOWN_TIMEOUT_MS'],
     });
 

@@ -11,7 +11,7 @@
 | **1 — Monolith** ✅ | Fastify + PostgreSQL | Request lifecycle, transactions, idempotency, graceful shutdown |
 | **2 — Event-Driven** ✅ | + Kafka | Producers, consumers, topics, partitions, async processing |
 | **3 — Distributed Processing** ✅ | + Consumer groups | Transactional outbox, idempotency, DLQs, retry, consumer scaling |
-| **4 — Coordination** | + Redis | Distributed locks, leader election, race conditions |
+| **4 — Coordination** ✅ | + Redis | Rate limiting, distributed locks, caching, leader election, order assignment |
 | **5 — Realtime** | + SSE | Streaming, backpressure, connection management |
 | **6 — Observability** | + Prometheus/Grafana | Metrics, tracing, structured logging |
 | **7 — Production** | + Kubernetes | Autoscaling, rolling deploys, resilience patterns |
@@ -194,11 +194,13 @@ open http://localhost:8080
 |---|---|---|
 | `POST` | `/api/v1/orders` | Create order (supports `Idempotency-Key` header) |
 | `GET` | `/api/v1/orders` | List orders (`?page=1&limit=20&status=PENDING&customerId=x`) |
-| `GET` | `/api/v1/orders/:id` | Get order by ID |
-| `PATCH` | `/api/v1/orders/:id/status` | Update order status (publishes event via outbox) |
-| `POST` | `/api/v1/orders/:id/cancel` | Cancel order (publishes event via outbox) |
+| `GET` | `/api/v1/orders/:id` | Get order by ID (cached via Redis — Phase 4) |
+| `PATCH` | `/api/v1/orders/:id/status` | Update status (distributed lock — Phase 4) |
+| `POST` | `/api/v1/orders/:id/cancel` | Cancel order (invalidates cache) |
 | `GET` | `/api/v1/orders/:id/history` | Get status change history |
-| `GET` | `/health` | Health check + DB pool metrics |
+| `POST` | `/api/v1/orders/:id/assign` | Assign driver to order (Phase 4) |
+| `GET` | `/api/v1/orders/:id/assignment` | Get current driver assignment (Phase 4) |
+| `GET` | `/health` | Health check (DB + Redis status) |
 
 ### Stop the System
 
@@ -217,10 +219,17 @@ docker compose down -v
 ```
 order-platform/
 ├── src/
-│   ├── index.ts                    # Entry point (startup + outbox relay)
-│   ├── server.ts                   # Fastify bootstrap, plugins, error handler
+│   ├── index.ts                    # Entry point (startup + Redis + leader election)
+│   ├── server.ts                   # Fastify bootstrap, plugins, rate limiter
 │   ├── config/index.ts             # Typed config with Zod validation
 │   ├── db/pool.ts                  # PostgreSQL connection pool
+│   ├── redis/                      # Phase 4 — Redis Coordination Layer
+│   │   ├── client.ts               # Redis client factory (singleton)
+│   │   ├── cache.ts                # Cache-aside service (get/set/invalidate)
+│   │   ├── distributed-lock.ts     # Lock/unlock with Lua scripts
+│   │   └── leader-election.ts      # Lease-based leadership for outbox relay
+│   ├── middleware/                  # Phase 4 — Request Middleware
+│   │   └── rate-limiter.ts         # Fixed window counter (Redis INCR)
 │   ├── outbox/                     # Phase 3 — Transactional Outbox
 │   │   ├── outbox.repository.ts    # Insert/query outbox events
 │   │   └── outbox-relay.ts         # Background poller → Kafka publisher
@@ -238,15 +247,16 @@ order-platform/
 │   ├── shared/
 │   │   ├── logger.ts               # Pino structured logger
 │   │   ├── errors.ts               # Custom error classes
-│   │   ├── health.ts               # /health endpoint
-│   │   └── shutdown.ts             # Graceful shutdown (+ outbox relay)
+│   │   ├── health.ts               # /health endpoint (DB + Redis)
+│   │   └── shutdown.ts             # Graceful shutdown (+ Redis + leader election)
 │   ├── modules/
 │   │   ├── orders/
 │   │   │   ├── order.types.ts      # Domain types + state machine
 │   │   │   ├── order.schemas.ts    # Zod validation schemas
 │   │   │   ├── order.repository.ts # Data access (with outbox callback)
 │   │   │   ├── order.service.ts    # Business logic (outbox pattern)
-│   │   │   └── order.routes.ts     # HTTP handlers
+│   │   │   ├── order.routes.ts     # HTTP handlers (cache + lock + assign)
+│   │   │   └── order-assignment.service.ts  # Phase 4 — Driver assignment (Redis NX)
 │   │   └── notifications/
 │   │       ├── notification.types.ts
 │   │       ├── notification.repository.ts
@@ -258,8 +268,9 @@ order-platform/
 ├── docs/
 │   ├── phase-1-architecture.md     # Phase 1 design notes
 │   ├── phase-2-architecture.md     # Phase 2 Kafka Architecture Decision Record
-│   └── phase-3-architecture.md     # Phase 3 Reliability Architecture Decision Record
-├── docker-compose.yml              # 8 services (3 consumer replicas)
+│   ├── phase-3-architecture.md     # Phase 3 Reliability Architecture Decision Record
+│   └── phase-4-architecture.md     # Phase 4 Redis Coordination Decision Record
+├── docker-compose.yml              # 9 services (+ Redis)
 ├── Dockerfile
 └── .env.example
 ```
@@ -284,3 +295,10 @@ order-platform/
 | **Dead Letter Queue** | Phase 3 | `kafka/dlq-producer.ts` | Captures permanently failing events for investigation |
 | **Consumer groups** | Phase 3 | `docker-compose.yml` | Horizontal scaling of event processing |
 | **Partial index** | Phase 3 | `init-db.sql` | Fast outbox polling regardless of table size |
+| **Rate limiting** | Phase 4 | `middleware/rate-limiter.ts` | Protects API from abuse across all instances |
+| **Distributed lock** | Phase 4 | `redis/distributed-lock.ts` | Prevents concurrent status update races |
+| **Cache-aside** | Phase 4 | `redis/cache.ts` | Reduces DB load for hot-path queries (10-50x faster) |
+| **Leader election** | Phase 4 | `redis/leader-election.ts` | Only one instance runs the outbox relay |
+| **Atomic assignment** | Phase 4 | `order-assignment.service.ts` | Prevents double driver assignment |
+| **Fail-open design** | Phase 4 | All Redis code | Redis outage doesn't break the API |
+| **Graceful degradation** | Phase 4 | `shared/health.ts` | Three-state health: healthy/degraded/unhealthy |

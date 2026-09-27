@@ -1,30 +1,30 @@
 // ============================================================
-// Entry Point — Application Startup (Phase 3: Transactional Outbox)
+// Entry Point — Application Startup (Phase 4: Redis Coordination)
 // ============================================================
 // 🔍 LEARNING NOTE: This is the ONLY file that runs process-level code.
-// It creates resources (DB pool, Kafka producer, outbox relay, server) and wires
+// It creates resources (DB pool, Redis, Kafka, outbox relay, server) and wires
 // everything together.
 //
-// 🔍 PHASE 3 EVOLUTION:
-// The Kafka producer is no longer injected into the OrderService.
-// Instead, the OrderService writes events to the outbox table
-// (atomically with order data), and the OutboxRelay polls the outbox
-// and publishes events to Kafka in the background.
+// 🔍 PHASE 4 EVOLUTION:
+// Added Redis as coordination layer. Redis is OPTIONAL — the app
+// gracefully degrades without it (no rate limiting, no caching,
+// no distributed locks, no leader election).
 // 
 // Startup order matters:
 // 1. Load config (validates env vars — fails fast)
 // 2. Create DB pool (doesn't connect yet — lazy initialization)
-// 3. Connect Kafka producer (for outbox relay)
-// 4. Start Outbox Relay (polls outbox → publishes to Kafka)
-// 5. Build server (registers routes and plugins)
-// 6. Start listening (begins accepting connections)
-// 7. Register shutdown handlers
+// 3. Connect Redis (for rate limiting, caching, locks, leader election)
+// 4. Connect Kafka producer (for outbox relay)
+// 5. Start leader election (determines which instance runs the relay)
+// 6. Build server (registers routes, rate limiter, and plugins)
+// 7. Start listening (begins accepting connections)
+// 8. Register shutdown handlers
 //
-// KEY ARCHITECTURE CHANGE:
-// The OrderService only writes to Postgres. It has ZERO Kafka awareness.
-// The OutboxRelay bridges Postgres → Kafka asynchronously.
-// If Kafka is down, events accumulate in the outbox and get published
-// when Kafka comes back. The API latency is completely independent of Kafka.
+// KEY PHASE 4 ARCHITECTURE CHANGE:
+// The outbox relay is now controlled by LEADER ELECTION.
+// Only the leader instance runs the relay — followers are idle.
+// If the leader dies, a follower acquires the lease within 15 seconds
+// and starts the relay. During the gap, events accumulate safely.
 
 import { config } from "./config/index.js";
 import { createPool } from "./db/pool.js";
@@ -35,6 +35,9 @@ import { createKafkaClient } from "./kafka/client.js";
 import { EventProducer } from "./kafka/producer.js";
 import { OutboxRepository } from "./outbox/outbox.repository.js";
 import { OutboxRelay } from "./outbox/outbox-relay.js";
+import { createRedisClient } from "./redis/client.js";
+import { LeaderElection } from './redis/leader-election.js';
+import Redis from 'ioredis';
 
 async function main(): Promise<void> {
   logger.info(
@@ -42,10 +45,11 @@ async function main(): Promise<void> {
       nodeEnv: config.nodeEnv,
       port: config.port,
       kafkaBrokers: config.kafkaBrokers || '(not configured)',
+      redisUrl: config.redisUrl || '(not configured)',
       notificationDelayMs: config.notificationDelayMs,
       notificationFailureRate: config.notificationFailureRate,
     },
-    "🚀 Starting Order Platform...",
+    "🚀 Starting Order Platform (Phase 4)...",
   );
 
   // Step 1: Create database connection pool
@@ -60,12 +64,56 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Step 3: Connect Kafka producer (for outbox relay)
-  // 🔍 PHASE 3 CHANGE: The producer is no longer injected into OrderService.
-  // It's only used by the OutboxRelay to publish events from the outbox table.
-  // If Kafka is down, the relay just can't publish — events stay in the outbox.
+  // Step 3: Connect Redis (optional)
+  // 🔍 PHASE 4 ADDITION: Redis provides:
+  // - Rate limiting (protect API from abuse)
+  // - Distributed locks (prevent concurrent status update races)
+  // - Caching (reduce DB load for hot-path queries)
+  // - Leader election (only one relay instance)
+  // - Order assignment (atomic driver coordination)
+  //
+  // If Redis is not configured or connection fails, the app still works.
+  // This is GRACEFUL DEGRADATION — a key production pattern.
+  let redis: Redis | null = null;
+  let leaderElection: LeaderElection | null = null;
+
+  if (config.redisUrl) {
+    try {
+      redis = createRedisClient();
+      // Verify connectivity with a PING
+      // 🔍 LEARNING NOTE: Since enableOfflineQueue is false, ping() fails immediately
+      // if the connection isn't fully established yet. We retry for a few seconds.
+      let connected = false;
+      for (let i = 0; i < 10; i++) {
+        try {
+          await redis.ping();
+          connected = true;
+          break;
+        } catch (e) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+      }
+      
+      if (!connected) {
+        throw new Error('Redis connection timeout during startup');
+      }
+      
+      logger.info('✅ Redis connected');
+    } catch (err) {
+      logger.warn(
+        { err },
+        '⚠️  Redis connection failed — running without Redis (degraded mode)'
+      );
+      redis = null;
+    }
+  } else {
+    logger.info('ℹ️  Redis not configured — coordination features disabled');
+  }
+
+  // Step 4: Connect Kafka producer (for outbox relay)
   let eventProducer: EventProducer | null = null;
   let outboxRelay: OutboxRelay | null = null;
+  let relayProducer: ReturnType<ReturnType<typeof createKafkaClient>['producer']> | null = null;
 
   if (config.kafkaBrokers) {
     try {
@@ -83,26 +131,54 @@ async function main(): Promise<void> {
       // For simplicity, we create a second producer for the relay.
       // In production, you might share the producer, but two producers
       // is fine and provides better fault isolation.
-      const relayProducer = kafka.producer({ allowAutoTopicCreation: false });
+      relayProducer = kafka.producer({ allowAutoTopicCreation: false });
       await relayProducer.connect();
 
       const outboxRepo = new OutboxRepository(pool);
       outboxRelay = new OutboxRelay(outboxRepo, relayProducer);
-      outboxRelay.start();
 
-      logger.info(
-        {
-          pollIntervalMs: config.outboxPollIntervalMs,
-          batchSize: config.outboxBatchSize
-        },
-        '📤 Outbox relay started'
-      );
+      // Step 5: Leader election for outbox relay (Phase 4)
+      // 🔍 PHASE 4 CHANGE: The relay is NO LONGER started immediately.
+      // Instead, leader election controls which instance runs it.
+      //
+      // WITH REDIS: Only the leader instance runs the relay.
+      //   Leader acquired → outboxRelay.start()
+      //   Leadership lost → outboxRelay.stop()
+      //
+      // WITHOUT REDIS: Every instance runs the relay (Phase 3 behavior).
+      //   Duplicates are handled by consumer idempotency.
+      if (redis) {
+        leaderElection = new LeaderElection(redis);
+        leaderElection.start(
+          // onBecomeLeader
+          () => {
+            logger.info('👑 This instance is now the LEADER — starting outbox relay');
+            outboxRelay!.start();
+          },
+
+          // onLoseLeadership
+          () => {
+            logger.warn('🏳️  This instance LOST leadership — stopping outbox relay');
+            outboxRelay!.stop();
+          }
+        );
+      } else {
+        // No Redis → start relay directly (Phase 3 behavior)
+        outboxRelay.start();
+
+        logger.info(
+          {
+            pollIntervalMs: config.outboxPollIntervalMs,
+            batchSize: config.outboxBatchSize,
+          },
+          '📤 Outbox relay started (no leader election — all instances relay)'
+        );
+      }
     } catch (err) {
       logger.warn(
         { err },
         '⚠️  Kafka/Outbox relay failed to start — events will accumulate in outbox'
       );
-      // Don't exit — the API still works, events just won't be published
       eventProducer = null;
       outboxRelay = null;
     }
@@ -110,11 +186,10 @@ async function main(): Promise<void> {
     logger.info('ℹ️ Kafka not configured — outbox realy disabled');
   }
 
-  // Step 5: Build and start HTTP server
-  // 🔍 PHASE 3 CHANGE: buildServer no longer takes an EventProducer.
-  // The OrderService writes to the outbox table directly — it has no
-  // Kafka dependency. This is a significant simplification.
-  const app = await buildServer(pool);
+  // Step 6: Build and start HTTP server
+  // 🔍 PHASE 4 CHANGE: buildServer now accepts Redis for rate limiting,
+  // caching, distributed locks, and order assignment.
+  const app = await buildServer(pool, redis);
 
   try {
     await app.listen({ port: config.port, host: config.host });
@@ -130,32 +205,50 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Step 5: Register graceful shutdown handlers
-  setupGracefulShutdown(app, pool, eventProducer, outboxRelay);
+  // Step 7: Register graceful shutdown handlers
+  setupGracefulShutdown(app, pool, eventProducer, outboxRelay, leaderElection);
 
   // Log startup summary
   logger.info('─'.repeat(60));
-  logger.info('📦 Order Platform — Phase 3 (Reliable Distributed Processing)');
+  logger.info('📦 Order Platform — Phase 4 (Distributed Coordination)');
   logger.info(`   Environment:  ${config.nodeEnv}`);
   logger.info(`   Port:         ${config.port}`);
   logger.info(`   Kafka:        ${config.kafkaBrokers || 'NOT CONFIGURED'}`);
-  logger.info(`   Notification: ${config.notificationDelayMs}ms delay, ${config.notificationFailureRate * 100}% failure rate`);
+  logger.info(`   Redis:        ${config.redisUrl || 'NOT CONFIGURED'}`);
   logger.info('');
   logger.info('   Endpoints:');
-  logger.info('   POST   /api/v1/orders          — Create order');
-  logger.info('   GET    /api/v1/orders           — List orders');
-  logger.info('   GET    /api/v1/orders/:id       — Get order');
-  logger.info('   PATCH  /api/v1/orders/:id/status — Update status');
-  logger.info('   POST   /api/v1/orders/:id/cancel — Cancel order');
-  logger.info('   GET    /api/v1/orders/:id/history — Status history');
-  logger.info('   GET    /health                  — Health check');
+  logger.info('   POST   /api/v1/orders             — Create order');
+  logger.info('   GET    /api/v1/orders              — List orders');
+  logger.info('   GET    /api/v1/orders/:id          — Get order (cached)');
+  logger.info('   PATCH  /api/v1/orders/:id/status   — Update status (locked)');
+  logger.info('   POST   /api/v1/orders/:id/cancel   — Cancel order');
+  logger.info('   GET    /api/v1/orders/:id/history  — Status history');
+  logger.info('   POST   /api/v1/orders/:id/assign   — Assign driver (Phase 4)');
+  logger.info('   GET    /api/v1/orders/:id/assignment — Get assignment (Phase 4)');
+  logger.info('   GET    /health                     — Health check');
+  logger.info('');
+  if (redis) {
+    logger.info('   🔴 Redis:           CONNECTED');
+    logger.info(`   🚦 Rate limiting:   ${config.rateLimitMaxRequests} req/${config.rateLimitWindowMs / 1000}s`);
+    logger.info(`   📦 Cache TTL:       ${config.cacheOrderTtlSeconds}s`);
+    logger.info(`   🔒 Distributed lock: ENABLED`);
+    logger.info(`   🗳️  Leader election: ${leaderElection?.isLeader ? 'LEADER' : 'FOLLOWER'}`);
+  } else {
+    logger.info('   ⚠️  Redis:           NOT CONNECTED (degraded mode)');
+    logger.info('   🚦 Rate limiting:   DISABLED');
+    logger.info('   📦 Cache:           DISABLED');
+    logger.info('   🔒 Distributed lock: DISABLED');
+  }
   logger.info('');
   if (outboxRelay) {
-    logger.info('   📤 Outbox relay:  ACTIVE (polling every ' + config.outboxPollIntervalMs + 'ms)');
+    const relayStatus = leaderElection
+      ? (leaderElection.isLeader ? 'ACTIVE (leader)' : 'STANDBY (follower)')
+      : 'ACTIVE (no leader election)';
+    logger.info(`   📤 Outbox relay:  ${relayStatus}`);
     logger.info(`   📨 Publishing to: ${config.kafkaTopicOrderEvents}`);
     logger.info(`   ☠️  DLQ topic:     ${config.kafkaTopicDlq}`);
   } else {
-    logger.info('   ⚠️  Outbox relay: INACTIVE (events accumulating in outbox table)');
+    logger.info('   ⚠️  Outbox relay: INACTIVE');
   }
   logger.info('─'.repeat(60));
 }
