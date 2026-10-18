@@ -87,6 +87,40 @@ const configSchema = z.object({
     leaderElectionLeaseTtlMs: z.coerce.number().int().min(1000).default(15000),
     leaderElectionHeartbeatMs: z.coerce.number().int().min(500).default(5000),
 
+    // SSE / Realtime (Phase 5)
+    // 🔍 LEARNING NOTE: SSE connections are LONG-LIVED. Unlike HTTP requests
+    // (milliseconds), SSE connections live for minutes to hours. Each one
+    // consumes a file descriptor, memory, and CPU (heartbeat timer).
+    // These limits protect the server from resource exhaustion.
+
+    // Heartbeat interval — keeps the connection alive through proxies.
+    // AWS ALB default idle timeout is 60s, Nginx is 60s.
+    // 15s heartbeat ensures we stay well under any proxy timeout.
+    sseHeartbeatIntervalMs: z.coerce.number().int().min(1000).default(15000),
+
+    // Maximum SSE connections per single order.
+    // Multiple clients can track the same order (customer, driver, restaurant).
+    sseMaxConnectionsPerOrder: z.coerce.number().int().min(1).default(10),
+
+    // Maximum TOTAL SSE connections across all orders.
+    // Each connection uses ~5KB memory + 1 file descriptor.
+    // 1000 connections ≈ 5MB memory + 1000 FDs.
+    sseMaxTotalConnections: z.coerce.number().int().min(1).default(1000),
+
+    // Backpressure high water mark — buffer size that triggers a WARNING.
+    // At 64KB, the client is noticeably falling behind but still recoverable.
+    sseBackpressureHighWaterMark: z.coerce.number().int().min(1024).default(65536),
+
+    // Backpressure critical mark — buffer size that triggers the POLICY.
+    // At 256KB per slow client, with 20 slow clients, that's 5MB of buffers.
+    sseBackpressureCriticalMark: z.coerce.number().int().min(4096).default(262144),
+
+    // Client retry delay hint (sent as SSE 'retry' field).
+    // Tells the browser's EventSource how long to wait before reconnecting.
+    // 3 seconds is a good balance: fast enough for UX, slow enough to not
+    // overwhelm the server during a mass-reconnection storm.
+    sseClientRetryMs: z.coerce.number().int().min(500).default(3000),
+
     // Graceful Shutdown
     shutdownTimeoutMs: z.coerce.number().int().positive().default(10000),
 });
@@ -122,6 +156,12 @@ function loadConfig(): Config {
         cacheOrderTtlSeconds: process.env['CACHE_ORDER_TTL_SECONDS'],
         leaderElectionLeaseTtlMs: process.env['LEADER_ELECTION_LEASE_TTL_MS'],
         leaderElectionHeartbeatMs: process.env['LEADER_ELECTION_HEARTBEAT_MS'],
+        sseHeartbeatIntervalMs: process.env['SSE_HEARTBEAT_INTERVAL_MS'],
+        sseMaxConnectionsPerOrder: process.env['SSE_MAX_CONNECTIONS_PER_ORDER'],
+        sseMaxTotalConnections: process.env['SSE_MAX_TOTAL_CONNECTIONS'],
+        sseBackpressureHighWaterMark: process.env['SSE_BACKPRESSURE_HIGH_WATER_MARK'],
+        sseBackpressureCriticalMark: process.env['SSE_BACKPRESSURE_CRITICAL_MARK'],
+        sseClientRetryMs: process.env['SSE_CLIENT_RETRY_MS'],
         shutdownTimeoutMs: process.env['SHUTDOWN_TIMEOUT_MS'],
     });
 

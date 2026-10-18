@@ -1,5 +1,5 @@
 // ============================================================
-// Consumer Process Entry Point (Phase 3: Reliable Processing)
+// Consumer Process Entry Point (Phase 5: + Redis Pub/Sub for SSE)
 // ============================================================
 // 🔍 LEARNING NOTE: This is a SEPARATE Node.js process from the
 // Order API (src/index.ts). It has its own lifecycle:
@@ -47,6 +47,7 @@
 //    restarting the API (zero-downtime for customers).
 
 import { Pool } from 'pg';
+import Redis from 'ioredis';
 import { config } from '../config/index.js';
 import { createModuleLogger } from '../shared/logger';
 import { createPool } from '../db/pool';
@@ -68,9 +69,9 @@ async function main(): Promise<void> {
             topic: config.kafkaTopicOrderEvents,
             dlqTopic: config.kafkaTopicDlq,
             maxRetries: config.consumerMaxRetries,
-            retryBaseDelay: config.consumerRetryBaseDelayMs
+            retryBaseDelayMs: config.consumerRetryBaseDelayMs
         },
-        '🚀 Starting notification consumer (Phase 3 — Reliable Processing)...'
+        '🚀 Starting notification consumer (Phase 5 — Reliable Processing + SSE)...'
     );
 
     // Step 1: Connect to PostgreSQL
@@ -111,9 +112,45 @@ async function main(): Promise<void> {
     //   3. Sends to DLQ after all retries exhausted
     //   4. Marks events as processed after success or DLQ
     const consumer = new KafkaConsumer(kafka, idempotencyStore, dlqProducer);
-    const handler = new NotificationConsumerHandler(pool);
 
-    // Step 5: Graceful shutdown
+    // Step 5: Connect Redis for SSE Pub/Sub (Phase 5)
+    // 🔍 PHASE 5 ADDITION: The consumer publishes to Redis Pub/Sub
+    // after processing events so SSE connections can push updates.
+    // Redis is OPTIONAL — the consumer works without it.
+    let redis: Redis | null = null;
+
+    if (config.redisUrl) {
+        try {
+            redis = new Redis(config.redisUrl, {
+                maxRetriesPerRequest: 3,
+                connectTimeout: 5000,
+                retryStrategy(times: number) {
+                    // Never return null — keep retrying so we auto-recover
+                    // when Redis comes back after a restart or blip.
+                    const delay = Math.min(times * 100, 10000);
+                    if (times <= 5 || times % 10 === 0) {
+                        console.warn(`[consumer] Redis reconnecting (attempt ${times}), delay ${delay}ms`);
+                    }
+                    return delay;
+                }
+            });
+            await redis.ping();
+            log.info('✅ Redis connected (for SSE Pub/Sub publishing)');
+        } catch (err) {
+            log.warn(
+                { err },
+                '⚠️  Redis connection failed — SSE updates will be skipped (degraded mode)'
+            );
+            redis = null;
+        }
+    } else {
+        log.info('ℹ️  Redis not configured — SSE Pub/Sub disabled');
+    }
+
+    // Pass redis to the handler for Pub/Sub publishing
+    const handler = new NotificationConsumerHandler(pool, redis, config.redisKeyPrefix);
+
+    // Step 6: Graceful shutdown
     // 🔍 LEARNING NOTE: Consumer shutdown is critical because:
     // 1. We need to commit final offsets (avoid reprocessing on restart)
     // 2. We need to leave the consumer group cleanly (triggers immediate
@@ -131,6 +168,12 @@ async function main(): Promise<void> {
             // Disconnect DLQ producer
             log.info('  ↳ DLQ producer stopped');
 
+            // Disconnect Redis (Phase 5)
+            if (redis) {
+                await redis.quit();
+                log.info('  ↳ Redis disconnected');
+            }
+
             // Then close DB pool
             await pool.end();
             log.info('  ↳ PostgreSQL pool closed');
@@ -146,7 +189,7 @@ async function main(): Promise<void> {
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('SIGINT', () => shutdown('SIGINT'));
 
-    // Step 6: Start consuming
+    // Step 7: Start consuming
     try {
         await consumer.start(config.kafkaTopicOrderEvents, handler);
         log.info('📥 Notification consumer is running (reliable mode: idempotent + retry + DLQ)');

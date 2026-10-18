@@ -1,23 +1,32 @@
 // ============================================================
-// Health Check (Phase 4 + Redis)
+// Health Check (Phase 5 + SSE Metrics)
 // ============================================================
 // Health checks are how infrastructure knows your service is alive.
 // 1. LIVENESS  — "Is the process alive?"
 // 2. READINESS — "Can this instance handle traffic?"
 // 3. STARTUP   — "Has the service finished initializing?"
 // 
-// For Phase 1-4, we implement /health as a combined check.
+// For Phase 1-5, we implement /health as a combined check.
 // We'll separate these in Phase 6+ when we add Kubernetes.
 // 
-// 🔍 PHASE 4 EVOLUTION:
-// Added Redis health check alongside PostgreSQL.
-// The overall status is "healthy" only if ALL dependencies are up.
-// Redis is optional — if not configured, its status is "not_configured".
+// 🔍 PHASE 5 EVOLUTION:
+// Added SSE metrics to the health check response.
+// This lets operators see:
+//   - How many SSE connections are active
+//   - How many orders are being tracked
+//   - Whether backpressure is occurring
+//   - Connection open/close rates
+//
+// In production, these metrics feed into dashboards and alerts:
+//   "SSE connections > 900 (out of 1000 max) → scale up"
+//   "Backpressure disconnects > 10/minute → investigate slow clients"
 
 import { FastifyInstance } from "fastify";
 import { Pool } from "pg";
 import Redis from 'ioredis';
 import { createModuleLogger } from "./logger.js";
+import { SSEManager } from "../sse/sse-manager.js";
+import { SSEMetrics } from "../sse/types.js";
 
 const log = createModuleLogger("health");
 
@@ -36,12 +45,18 @@ interface HealthCheckResult {
         waiting: number;
       };
     },
-    // 🔍 PHASE 4 ADDITION: Redis health check.
-    // We report latency and connection status so operators can
-    // spot Redis performance degradation before it causes issues
     redis: {
       status: 'up' | 'down' | 'not_configured',
       latencyMs: number
+    },
+    // 🔍 PHASE 5 ADDITION: SSE metrics in health check.
+    // These are critical for capacity planning:
+    //   activeConnections / maxTotalConnections = utilization
+    //   backpressureEventsTotal increasing = clients are slow
+    //   eventsDroppedTotal increasing = we're losing updates
+    sse: {
+      status: 'active' | 'disabled',
+      metrics: SSEMetrics | null
     }
   };
 }
@@ -49,7 +64,8 @@ interface HealthCheckResult {
 export async function registerHealthRoutes(
   app: FastifyInstance,
   pool: Pool,
-  redis: Redis | null = null
+  redis: Redis | null = null,
+  sseManager: SSEManager | null = null
 ): Promise<void> {
   app.get("/health", async (_request, reply) => {
     let dbStatus: "up" | "down" = "down";
@@ -123,6 +139,11 @@ export async function registerHealthRoutes(
         redis: {
           status: redisStatus,
           latencyMs: redisLatency
+        },
+        // 🔍 PHASE 5 ADDITION: SSE metrics
+        sse: {
+          status: sseManager ? 'active' : 'disabled',
+          metrics: sseManager ? sseManager.getMetrics() : null
         }
       },
     };
