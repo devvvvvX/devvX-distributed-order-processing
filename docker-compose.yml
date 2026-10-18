@@ -1,21 +1,23 @@
 # ============================================================
-# Phase 4 — Docker Compose: Distributed Coordination with Redis
+# Phase 5 — Docker Compose: Realtime SSE + Backpressure
 # ============================================================
-# 🔍 LEARNING NOTE: Phase 4 infrastructure changes:
+# 🔍 LEARNING NOTE: Phase 5 infrastructure changes:
 #   Phase 1: 2 services (app + postgres)
 #   Phase 2: 6 services (app + postgres + kafka + kafka-init + kafka-ui + 1 consumer)
 #   Phase 3: 8 services (app + postgres + kafka + kafka-init + kafka-ui + 3 consumers)
 #   Phase 4: 9 services (+ Redis)
+#   Phase 5: 9 services (same count — SSE uses existing Redis)
 #
 # What changed:
-# 1. Added Redis service (coordination layer)
-# 2. App gets Redis config → rate limiting, caching, locks, leader election
-# 3. Consumers get Redis config → for future use (DLQ replay, etc.)
-# 4. App depends on Redis (in addition to Postgres and Kafka)
+# 1. App gets SSE config (heartbeat, connection limits, backpressure)
+# 2. Consumers get REDIS_URL (for Pub/Sub publishing to SSE)
+# 3. No new infrastructure services! SSE reuses existing Redis.
 #
-# 🔍 LEARNING NOTE: Redis adds minimal operational overhead compared
-# to the value it provides. A single Redis instance handles 100,000+
-# operations/second. For our learning setup, it's a 6MB Alpine container.
+# 🔍 LEARNING NOTE: This is a common pattern in distributed systems:
+# adding new CAPABILITIES without new INFRASTRUCTURE. Redis Pub/Sub
+# is a feature of the Redis instance we already run for caching/locks.
+# This marginal cost of SSE is near zero at the infrastructure level.
+
 services:
   # ─────────────────────────────────────────────────
   # PostgreSQL — Our single source of truth
@@ -199,6 +201,13 @@ services:
       # Leader election
       LEADER_ELECTION_LEASE_TTL_MS: 15000
       LEADER_ELECTION_HEARTBEAT_MS: 5000
+      # SSE configuration (Phase 5)
+      SSE_HEARTBEAT_INTERVAL_MS: 15000
+      SSE_MAX_CONNECTIONS_PER_ORDER: 10
+      SSE_MAX_TOTAL_CONNECTIONS: 1000
+      SSE_BACKPRESSURE_HIGH_WATER_MARK: 65536
+      SSE_BACKPRESSURE_CRITICAL_MARK: 262144
+      SSE_CLIENT_RETRY_MS: 3000
     depends_on:
       postgres:
         condition: service_healthy
@@ -218,9 +227,11 @@ services:
   # ─────────────────────────────────────────────────
   # Notification Consumers — Consumer Group (3 instances)
   # ─────────────────────────────────────────────────
-  # 🔍 LEARNING NOTE: Consumers don't need Redis for their core function
-  # (idempotent event processing). But we pass REDIS_URL so they could
-  # use it for future features (e.g., DLQ replay, distributed tracing).
+  # 🔍 PHASE 5 CHANGE: Consumers now get REDIS_URL so they can
+  # PUBLISH to Redis Pub/Sub after processing events. This bridges
+  # the gap between Kafka (internal) and SSE (client-facing).
+  # 
+  # Data flow: Kafka → Consumer → Redis PUBLISH → API SUBSCRIBE → SSE → Client
   notification-consumer-1:
     build:
       context: .
@@ -242,8 +253,13 @@ services:
       KAFKA_TOPIC_DLQ: order-events-dlq
       CONSUMER_MAX_RETRIES: 3
       CONSUMER_RETRY_BASE_DELAY_MS: 1000
+      # Redis for SSE Pub/Sub (Phase 5)
+      REDIS_URL: redis://redis:6379
+      REDIS_KEY_PREFIX: "op:"
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       kafka:
         condition: service_healthy
@@ -276,8 +292,13 @@ services:
       # Retry configuration (Phase 3)
       CONSUMER_MAX_RETRIES: 3
       CONSUMER_RETRY_BASE_DELAY_MS: 1000
+      # Redis for SSE Pub/Sub (Phase 5)
+      REDIS_URL: redis://redis:6379
+      REDIS_KEY_PREFIX: "op:"
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       kafka:
         condition: service_healthy
@@ -310,8 +331,13 @@ services:
       # Retry configuration (Phase 3)
       CONSUMER_MAX_RETRIES: 3
       CONSUMER_RETRY_BASE_DELAY_MS: 1000
+      # Redis for SSE Pub/Sub (Phase 5)
+      REDIS_URL: redis://redis:6379
+      REDIS_KEY_PREFIX: "op:"
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       kafka:
         condition: service_healthy

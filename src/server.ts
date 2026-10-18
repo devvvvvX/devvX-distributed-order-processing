@@ -23,14 +23,17 @@ import { Pool } from "pg";
 import Redis from 'ioredis';
 import { config } from "./config/index.js";
 import { registerOrderRoutes } from "./modules/orders/order.routes.js";
+import { registerSSERoutes } from "./sse/sse-routes.js";
 import { registerHealthRoutes } from "./shared/health.js";
 import { AppError } from "./shared/errors.js";
 import { ApiResponse } from "./types/index.js";
 import { createRateLimiter } from "./middleware/rate-limiter.js";
+import { SSEManager } from "./sse/sse-manager.js";
 
 export async function buildServer(
   pool: Pool,
-  redis: Redis | null = null
+  redis: Redis | null = null,
+  sseManager: SSEManager | null = null
 ): Promise<FastifyInstance> {
   // 🔍 LEARNING NOTE: In Fastify v5, the `logger` option only accepts a
   // plain config object — you cannot pass a Pino instance directly.
@@ -209,8 +212,17 @@ export async function buildServer(
   // Routes
   // ─────────────────────────────────────────────────
 
-  await registerHealthRoutes(app, pool, redis);
+  await registerHealthRoutes(app, pool, redis, sseManager);
   await registerOrderRoutes(app, pool, redis);
+
+  // 🔍 PHASE 5 ADDITION: SSE routes for realtime order streaming.
+  // These are registered separately because SSE routes use reply.hijack()
+  // which bypasses Fastify's normal response pipeline (serialization,
+  // onResponse hooks, etc.). The SSE route handler takes full control
+  // of the underlying Node.js response object.
+  if (sseManager) {
+    await registerSSERoutes(app, pool, sseManager);
+  }
 
   return app;
 }

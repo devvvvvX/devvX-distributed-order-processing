@@ -12,7 +12,7 @@
 | **2 — Event-Driven** ✅ | + Kafka | Producers, consumers, topics, partitions, async processing |
 | **3 — Distributed Processing** ✅ | + Consumer groups | Transactional outbox, idempotency, DLQs, retry, consumer scaling |
 | **4 — Coordination** ✅ | + Redis | Rate limiting, distributed locks, caching, leader election, order assignment |
-| **5 — Realtime** | + SSE | Streaming, backpressure, connection management |
+| **5 — Realtime** ✅ | + SSE + Redis Pub/Sub | SSE streaming, backpressure, cross-instance fanout, connection lifecycle |
 | **6 — Observability** | + Prometheus/Grafana | Metrics, tracing, structured logging |
 | **7 — Production** | + Kubernetes | Autoscaling, rolling deploys, resilience patterns |
 
@@ -138,6 +138,68 @@ Client → Fastify (HTTP) → OrderService → OrderRepository → PostgreSQL
 └────────────────────────────────────────────────────────────────────┘
 ```
 
+---
+
+## Phase 5 — Realtime SSE + Backpressure
+
+### What You'll Learn in Phase 5
+
+- **Server-Sent Events (SSE)**: HTTP-based unidirectional streaming — the response that never closes
+- **SSE Protocol**: `text/event-stream` content type, `event:`, `data:`, `id:`, `retry:` fields
+- **Redis Pub/Sub**: Fire-and-forget broadcast for cross-instance event fanout
+- **Backpressure**: Why ignoring `res.write()` return value kills production SSE servers
+- **Connection Lifecycle**: Heartbeats, proxy keepalive, dead connection detection, graceful drain
+- **Cross-Instance Fanout**: Why in-process events don't work across multiple API instances
+- **SSE vs WebSockets**: When unidirectional push is the right architectural choice
+
+### Architecture (Phase 5)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     ORDER API (Fastify + SSE)                           │
+│                                                                         │
+│  GET /orders/:id/stream ───────────────┐                                │
+│    1. Validate order exists            │                                │
+│    2. reply.hijack() (raw response)    │                                │
+│    3. SSEManager.addConnection()       │                                │
+│    4. Send initial_state event         │                                │
+│    5. Start heartbeat (15s)            │                                │
+│                                        ▼                                │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │  SSEManager                                                      │   │
+│  │  ┌──────────────────────────────┐                                │   │
+│  │  │ order:123 → [conn-A, conn-B] │  ← orderId → Set<Connection>  │   │
+│  │  │ order:456 → [conn-C]         │                                │   │
+│  │  └──────────────────────────────┘                                │   │
+│  │                                                                  │   │
+│  │  broadcastToOrder(id, event) → fan out to all connections        │   │
+│  └────────────────────────────────────┬─────────────────────────────┘   │
+│                                       │ subscribe/unsubscribe           │
+│  ┌────────────────────────────────────▼─────────────────────────────┐   │
+│  │  SSERedisSubscriber (dedicated Redis connection)                  │   │
+│  │  SUBSCRIBE op:sse:order:123                                      │   │
+│  │  SUBSCRIBE op:sse:order:456                                      │   │
+│  │  on message → SSEManager.broadcastToOrder()                      │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+                                       ▲
+                                       │ PUBLISH op:sse:order:123
+                                       │
+┌──────────────────────────────────────────────────────────────────────┐
+│  NOTIFICATION CONSUMER                                               │
+│  1. Consume ORDER_STATUS_CHANGED from Kafka                          │
+│  2. Process notification                                             │
+│  3. PUBLISH to Redis Pub/Sub ← bridges Kafka → SSE                   │
+└──────────────────────────────────────────────────────────────────────┘
+
+Backpressure handling (per connection):
+┌───────────────────────────────────────────────────────────────────┐
+│  Buffer < 64KB:   ✅ ACCEPT (normal)                             │
+│  Buffer 64-256KB: ⚠️  ACCEPT + WARNING (client falling behind)   │
+│  Buffer > 256KB:  🛑 APPLY POLICY (DROP_NEWEST / DISCONNECT)     │
+└───────────────────────────────────────────────────────────────────┘
+```
+
 ### Quick Start
 
 ```bash
@@ -200,7 +262,8 @@ open http://localhost:8080
 | `GET` | `/api/v1/orders/:id/history` | Get status change history |
 | `POST` | `/api/v1/orders/:id/assign` | Assign driver to order (Phase 4) |
 | `GET` | `/api/v1/orders/:id/assignment` | Get current driver assignment (Phase 4) |
-| `GET` | `/health` | Health check (DB + Redis status) |
+| `GET` | `/api/v1/orders/:id/stream` | SSE realtime order stream (Phase 5) |
+| `GET` | `/health` | Health check (DB + Redis + SSE metrics) |
 
 ### Stop the System
 
@@ -228,6 +291,14 @@ order-platform/
 │   │   ├── cache.ts                # Cache-aside service (get/set/invalidate)
 │   │   ├── distributed-lock.ts     # Lock/unlock with Lua scripts
 │   │   └── leader-election.ts      # Lease-based leadership for outbox relay
+│   ├── sse/                        # Phase 5 — Realtime SSE Streaming
+│   │   ├── types.ts                # SSE events, states, backpressure config, metrics
+│   │   ├── sse-connection.ts       # Per-client stream (protocol, heartbeat, backpressure)
+│   │   ├── sse-backpressure.ts     # Buffer tracking, thresholds, policy enforcement
+│   │   ├── sse-manager.ts          # Connection registry, fanout, limits, drain
+│   │   ├── redis-subscriber.ts     # Dedicated Redis SUBSCRIBE, auto-resubscribe
+│   │   ├── sse-routes.ts           # GET /orders/:id/stream endpoint
+│   │   └── index.ts                # Barrel export
 │   ├── middleware/                  # Phase 4 — Request Middleware
 │   │   └── rate-limiter.ts         # Fixed window counter (Redis INCR)
 │   ├── outbox/                     # Phase 3 — Transactional Outbox
@@ -242,13 +313,13 @@ order-platform/
 │   │   ├── retry.ts                # Phase 3 — Exponential backoff + jitter
 │   │   └── dlq-producer.ts         # Phase 3 — Dead Letter Queue publisher
 │   ├── consumers/                  # Background Consumer Services
-│   │   ├── index.ts                # Consumer process entry point
-│   │   └── notification-consumer.ts# Business handler for order notifications
+│   │   ├── index.ts                # Consumer process entry point (+ Redis Pub/Sub)
+│   │   └── notification-consumer.ts# Business handler (+ Redis PUBLISH for SSE)
 │   ├── shared/
 │   │   ├── logger.ts               # Pino structured logger
 │   │   ├── errors.ts               # Custom error classes
-│   │   ├── health.ts               # /health endpoint (DB + Redis)
-│   │   └── shutdown.ts             # Graceful shutdown (+ Redis + leader election)
+│   │   ├── health.ts               # /health endpoint (DB + Redis + SSE metrics)
+│   │   └── shutdown.ts             # Graceful shutdown (+ SSE drain + Redis sub)
 │   ├── modules/
 │   │   ├── orders/
 │   │   │   ├── order.types.ts      # Domain types + state machine
@@ -269,8 +340,9 @@ order-platform/
 │   ├── phase-1-architecture.md     # Phase 1 design notes
 │   ├── phase-2-architecture.md     # Phase 2 Kafka Architecture Decision Record
 │   ├── phase-3-architecture.md     # Phase 3 Reliability Architecture Decision Record
-│   └── phase-4-architecture.md     # Phase 4 Redis Coordination Decision Record
-├── docker-compose.yml              # 9 services (+ Redis)
+│   ├── phase-4-architecture.md     # Phase 4 Redis Coordination Decision Record
+│   └── phase-5-architecture.md     # Phase 5 SSE + Backpressure Decision Record
+├── docker-compose.yml              # 9 services (+ SSE config)
 ├── Dockerfile
 └── .env.example
 ```
@@ -302,3 +374,9 @@ order-platform/
 | **Atomic assignment** | Phase 4 | `order-assignment.service.ts` | Prevents double driver assignment |
 | **Fail-open design** | Phase 4 | All Redis code | Redis outage doesn't break the API |
 | **Graceful degradation** | Phase 4 | `shared/health.ts` | Three-state health: healthy/degraded/unhealthy |
+| **SSE streaming** | Phase 5 | `sse/sse-connection.ts` | Push-based realtime updates (replaces polling) |
+| **SSE protocol** | Phase 5 | `sse/sse-connection.ts` | `text/event-stream`, `Last-Event-ID` resume, heartbeats |
+| **Backpressure handling** | Phase 5 | `sse/sse-backpressure.ts` | Prevents OOM from slow clients (buffer tracking + policy) |
+| **Cross-instance fanout** | Phase 5 | `sse/redis-subscriber.ts` | Redis Pub/Sub broadcasts to correct API instance |
+| **Connection lifecycle** | Phase 5 | `sse/sse-manager.ts` | Heartbeat keepalive, dead detection, graceful drain |
+| **Pub/Sub fanout** | Phase 5 | `sse/redis-subscriber.ts` | Dedicated SUBSCRIBE connection, auto-resubscribe |

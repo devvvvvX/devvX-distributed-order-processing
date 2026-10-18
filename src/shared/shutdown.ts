@@ -1,23 +1,32 @@
 // ============================================================
-// Graceful Shutdown (Phase 4: + Redis + Leader Election)
+// Graceful Shutdown (Phase 5: + SSE Connections)
 // ============================================================
 // 🔍 LEARNING NOTE: Graceful shutdown is one of the most important
 // production patterns, and one of the most commonly overlooked.
 //
-// 🔍 PHASE 4 EVOLUTION:
-// Added leader election and Redis to the shutdown sequence.
+// 🔍 PHASE 5 EVOLUTION:
+// Added SSE connection draining and Redis Pub/Sub subscriber cleanup.
+// 
 // Shutdown order (reverse of startup):
-//   1. HTTP server → stop accepting new connections
-//   2. Leader election → release leadership (follower takes over relay)
-//   3. Outbox relay → stop polling, flush in-progress batch
-//   4. Kafka producer → flush pending events
-//   5. Redis → disconnect
-//   6. DB pool → close connections
+//   1. SSE connections → drain all (send 'shutdown' event to clients)
+//   2. HTTP server → stop accepting new connections
+//   3. Leader election → release leadership (follower takes over relay)
+//   4. Outbox relay → stop polling, flush in-progress batch
+//   5. Kafka producer → flush pending events
+//   6. SSE Redis subscriber → unsubscribe all, disconnect
+//   7. Redis (main) → disconnect
+//   8. DB pool → close connections
 //
 // The leader election MUST be stopped BEFORE the outbox relay,
 // because releasing leadership triggers the relay stop callback.
 // Redis MUST be disconnected AFTER leader election stops (it needs
 // Redis to release the lease).
+// 
+// KEY PHASE 5 INSIGHT: SSE must be drained BEFORE closing the HTTP server.
+// Why? Because closing the HTTP server immediately RST-closes all
+// active connections. If we close HTTP first, SSE clients see an
+// abrupt connection drop with no explanation. By draining first,
+// clients receive a clean 'shutdown' event and can reconnect gracefully.
 
 import { FastifyInstance } from "fastify";
 import { Pool } from "pg";
@@ -27,6 +36,8 @@ import { EventProducer } from "../kafka/producer.js";
 import { OutboxRelay } from "../outbox/outbox-relay.js";
 import { LeaderElection } from "../redis/leader-election.js";
 import { disconnectRedis } from "../redis/client.js";
+import { SSEManager } from "../sse/sse-manager.js";
+import { SSERedisSubscriber } from "../sse/redis-subscriber.js";
 
 const log = createModuleLogger("shutdown");
 
@@ -35,7 +46,9 @@ export function setupGracefulShutdown(
   pool: Pool,
   eventProducer: EventProducer | null = null,
   outboxRelay: OutboxRelay | null = null,
-  leaderElection: LeaderElection | null = null
+  leaderElection: LeaderElection | null = null,
+  sseManager: SSEManager | null = null,
+  sseSubscriber: SSERedisSubscriber | null = null
 ): void {
   let isShuttingDown = false;
 
@@ -64,13 +77,24 @@ export function setupGracefulShutdown(
     forceExitTimer.unref();
 
     try {
-      // Step 1: Stop accepting new HTTP connections
+      // Step 1: Drain SSE connections (Phase 5)
+      // 🔍 PHASE 5 ADDITION: Send 'shutdown' event to all SSE clients.
+      // This gives clients a chance to show "reconnecting..." UI
+      // instead of an error. EventSource auto-reconnection will kick in
+      // and the client will land on another instance (if available).
+      if (sseManager) {
+        log.info('Draining SSE connections...');
+        await sseManager.shutdown();
+        log.info('✅ SSE connections drained');
+      }
+
+      // Step 2: Stop accepting new HTTP connections
       // In-flight requests will still be processed.
       log.info("Closing HTTP Server (no new connections)...");
       await app.close();
       log.info("✅ HTTP server closed");
 
-      // Step 2: Stop leader election (releases lease → follower takes over)
+      // Step 3: Stop leader election (releases lease → follower takes over)
       // 🔍 PHASE 4 ADDITION: This must happen BEFORE stopping the relay.
       // Releasing the lease tells other instances they can become leader.
       // The onLoseLeadership callback will stop the relay.
@@ -80,7 +104,7 @@ export function setupGracefulShutdown(
         log.info('✅ Leader election stopped');
       }
 
-      // Step 3: Stop outbox relay (if still running - might already be stopped
+      // Step 4: Stop outbox relay (if still running - might already be stopped
       // be stopped by leadership loss callback)
       if (outboxRelay) {
         log.info('Stopping outbox relay...');
@@ -88,7 +112,7 @@ export function setupGracefulShutdown(
         log.info('✅ Outbox relay stopped');
       }
 
-      // Step 4: Disconnect Kafka producer (flush pending events)
+      // Step 5: Disconnect Kafka producer (flush pending events)
       // 🔍 LEARNING NOTE: The producer's disconnect() flushes its
       // internal buffer, ensuring no events are lost. This must happen
       // BEFORE closing the DB pool because the producer might still
@@ -99,13 +123,22 @@ export function setupGracefulShutdown(
         log.info('✅ Kafka producer disconnected');
       }
 
-      // Step 5: Disconnect Redis
-      // 🔍 PHASE 4 ADDITION: Redis disconnect must happen AFTER
-      // leader election stops (it needs Redis to release the lease).
+      // Step 6: Disconnect SSE Redis subscriber (Phase 5)
+      // 🔍 PHASE 5 ADDITION: The subscriber has its OWN Redis connection
+      // (separate from the main Redis client used for caching/locks).
+      // We disconnect it before the main Redis connection.
+      if (sseSubscriber) {
+        log.info('Disconnecting SSE Redis subscriber...');
+        await sseSubscriber.disconnect();
+        log.info('✅ SSE Redis subscriber disconnected');
+      }
+
+      // Step 7: Disconnect Redis (main)
       log.info('Disconnecting Redis...');
       await disconnectRedis();
+      log.info('✅ Redis disconnected');
 
-      // Step 6: Close database pool
+      // Step 8: Close database pool
       // This waits for active queries to finish, then closes connections.
       log.info("Closing database pool...");
       await pool.end();

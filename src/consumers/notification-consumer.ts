@@ -3,7 +3,18 @@
 // ============================================================
 // 🔍 LEARNING NOTE: This is the consumer that replaces the synchronous
 // notification call in the order service.
+// 
+// 🔍 PHASE 5 EVOLUTION:
+// After processing events, the consumer now PUBLISHES to Redis Pub/Sub.
+// This bridges the gap between Kafka (internal event bus) and SSE
+// (client-facing realtime stream). The consumer acts as a translator:
+//   Kafka event → notification logic → Redis Pub/Sub → SSE → client
 //
+// Why does the CONSUMER publish, not the API?
+// Because the API only writes to the outbox. The consumer is where
+// events are PROCESSED. Publishing to Redis here means SSE updates
+// happen exactly when notifications are sent — consistent and accurate.
+// 
 // BEFORE (Phase 1 — synchronous):
 //   Client → OrderService.createOrder() → NotificationService.send() → respond
 //   Total latency: ~520ms (20ms order + 500ms notification)
@@ -30,13 +41,24 @@ import {
 import { NotificationService } from "../modules/notifications/notification.service";
 import { NotificationRepository } from "../modules/notifications/notification.repository";
 import { createModuleLogger } from "../shared/logger";
+import Redis from 'ioredis';
+import { publishOrderUpdate } from "../sse/redis-subscriber.js";
+import type { RedisPubSubMessage, OrderStreamEventType } from "../sse/types.js";
 
 const log = createModuleLogger('notification-consumer');
 
 export class NotificationConsumerHandler implements MessageHandler {
     private readonly notificationService: NotificationService;
 
-    constructor(pool: Pool) {
+    // 🔍 PHASE 5 ADDITION: Redis client for Pub/Sub publishing.
+    // The consumer uses the MAIN Redis connection to publish (not subscribe).
+    // Publishing does NOT require a dedicated connection.
+    // If Redis is null, SSE updates are skipped (degraded mode).
+    constructor(
+        pool: Pool,
+        private readonly redis: Redis | null = null,
+        private readonly redisKeyPrefix: string = 'op:',
+    ) {
         const notificationRepo = new NotificationRepository(pool);
         this.notificationService = new NotificationService(notificationRepo);
     }
@@ -153,6 +175,17 @@ export class NotificationConsumerHandler implements MessageHandler {
             },
             `✉️  Order confirmation sent for ${order.id} (${latency}ms)`
         );
+
+        // 🔍 PHASE 5 ADDITION: Publish to Redis Pub/Sub for SSE fanout.
+        // This pushes the order creation event to any connected SSE clients.
+        await this.publishToSSE(order.id, 'status_update', {
+            orderId: order.id,
+            status: 'PENDING',
+            customerName: order.customerName,
+            restaurantName: order.restaurantName,
+            grandTotal: order.grandTotal,
+            message: 'Order placed successfully',
+        });
     }
 
     // ─────────────────────────────────────────────────
@@ -190,5 +223,49 @@ export class NotificationConsumerHandler implements MessageHandler {
             },
             `✉️  Status notification sent: ${newStatus} for ${orderId} (${latency}ms)`
         );
+
+        // 🔍 PHASE 5 ADDITION: Publish status change to SSE
+        const sseEventType: OrderStreamEventType =
+            newStatus === 'CANCELLED' ? 'order_cancelled' : 'status_update';
+
+        await this.publishToSSE(orderId, sseEventType, {
+            orderId,
+            previousStatus: event.payload.previousStatus,
+            newStatus,
+            changedBy: event.payload.changedBy,
+            reason: event.payload.reason,
+            customerName,
+            restaurantName: event.payload.restaurantName,
+        });
+    }
+
+    // ─────────────────────────────────────────────────
+    // Publish to Redis Pub/Sub for SSE fanout (Phase 5)
+    // ─────────────────────────────────────────────────
+    // 🔍 LEARNING NOTE: This bridges Kafka → Redis → SSE.
+    // The consumer translates internal Kafka events into client-facing
+    // SSE events. This is intentional separation of concerns:
+    //   - Kafka events: internal, detailed, for service communication
+    //   - SSE events: external, simplified, for client UI updates
+    //
+    // If Redis is not configured, SSE updates are silently skipped.
+    // This is GRACEFUL DEGRADATION — the consumer still processes
+    // notifications normally, just without realtime push.
+    private async publishToSSE(
+        orderId: string,
+        eventType: OrderStreamEventType,
+        data: Record<string, unknown>
+    ): Promise<void> {
+        if (!this.redis) return;
+
+        const message: RedisPubSubMessage = {
+            eventType,
+            orderId,
+            data,
+            timestamp: new Date().toISOString(),
+            source: 'notification-consumer',
+        };
+
+        await publishOrderUpdate(this.redis, this.redisKeyPrefix, message);
     }
 }

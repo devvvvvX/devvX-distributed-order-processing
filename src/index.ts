@@ -1,24 +1,36 @@
 // ============================================================
-// Entry Point — Application Startup (Phase 4: Redis Coordination)
+// Entry Point — Application Startup (Phase 5: + SSE Realtime)
 // ============================================================
 // 🔍 LEARNING NOTE: This is the ONLY file that runs process-level code.
-// It creates resources (DB pool, Redis, Kafka, outbox relay, server) and wires
+// It creates resources (DB pool, Redis, Kafka, outbox relay, SSE, server) and wires
 // everything together.
-//
-// 🔍 PHASE 4 EVOLUTION:
-// Added Redis as coordination layer. Redis is OPTIONAL — the app
-// gracefully degrades without it (no rate limiting, no caching,
-// no distributed locks, no leader election).
 // 
+// 🔍 PHASE 5 EVOLUTION:
+// Added Server-Sent Events (SSE) for realtime order tracking.
+// The SSE subsystem has THREE components:
+//
+// 1. SSEManager — holds all active SSE connections, routes events
+//    to the correct connections, manages connection lifecycle
+//
+// 2. SSERedisSubscriber — listens to Redis Pub/Sub channels for
+//    order updates, forwards them to SSEManager for fanout
+//
+// 3. SSE Routes — HTTP endpoint (GET /orders/:id/stream) that
+//    opens SSE connections and registers them with SSEManager
+//
+// Data flow:
+//   Kafka → Consumer → Redis PUBLISH → Redis SUBSCRIBE → SSEManager → Client
+//
 // Startup order matters:
-// 1. Load config (validates env vars — fails fast)
-// 2. Create DB pool (doesn't connect yet — lazy initialization)
+// 1. Load config
+// 2. Create DB pool + verify connectivity
 // 3. Connect Redis (for rate limiting, caching, locks, leader election)
 // 4. Connect Kafka producer (for outbox relay)
 // 5. Start leader election (determines which instance runs the relay)
-// 6. Build server (registers routes, rate limiter, and plugins)
-// 7. Start listening (begins accepting connections)
-// 8. Register shutdown handlers
+// 6. Create SSE infrastructure (mananger + Redis subscriber)
+// 7. Build server (registers routes, rate limiter, SSE endpoint)
+// 8. Start listening
+// 9. Register shutdown handlers
 //
 // KEY PHASE 4 ARCHITECTURE CHANGE:
 // The outbox relay is now controlled by LEADER ELECTION.
@@ -37,6 +49,9 @@ import { OutboxRepository } from "./outbox/outbox.repository.js";
 import { OutboxRelay } from "./outbox/outbox-relay.js";
 import { createRedisClient } from "./redis/client.js";
 import { LeaderElection } from './redis/leader-election.js';
+import { SSEManager } from "./sse/sse-manager.js";
+import { SSERedisSubscriber } from "./sse/redis-subscriber.js";
+import { BackpressurePolicy } from "./sse/types.js";
 import Redis from 'ioredis';
 
 async function main(): Promise<void> {
@@ -49,7 +64,7 @@ async function main(): Promise<void> {
       notificationDelayMs: config.notificationDelayMs,
       notificationFailureRate: config.notificationFailureRate,
     },
-    "🚀 Starting Order Platform (Phase 4)...",
+    "🚀 Starting Order Platform (Phase 5)...",
   );
 
   // Step 1: Create database connection pool
@@ -186,10 +201,68 @@ async function main(): Promise<void> {
     logger.info('ℹ️ Kafka not configured — outbox realy disabled');
   }
 
-  // Step 6: Build and start HTTP server
-  // 🔍 PHASE 4 CHANGE: buildServer now accepts Redis for rate limiting,
-  // caching, distributed locks, and order assignment.
-  const app = await buildServer(pool, redis);
+  // Step 6: Create SSE infrastructure (Phase 5)
+  // 🔍 PHASE 5 ADDITION: SSE is our realtime layer.
+  // It requires Redis for cross-instance fanout (Pub/Sub).
+  // Without Redis, SSE still works for single-instance deployments —
+  // direct event publishing from the order service would work.
+  // But cross-instance fanout requires Redis Pub/Sub.
+  //
+  // Components:
+  //   SSEManager — connection registry + fanout
+  //   SSERedisSubscriber — Redis Pub/Sub → SSEManager bridge
+  //
+  // The subscriber creates a DEDICATED Redis connection because
+  // Redis requires separate connections for SUBSCRIBE mode.
+  let sseManager: SSEManager | null = null;
+  let sseSubscriber: SSERedisSubscriber | null = null;
+
+  // SSE manager is always created (handles in-process connections)
+  sseManager = new SSEManager({
+    maxTotalConnections: config.sseMaxTotalConnections,
+    maxConnectionsPerOrder: config.sseMaxConnectionsPerOrder,
+    heartbeatIntervalMs: config.sseHeartbeatIntervalMs,
+    clientRetryMs: config.sseClientRetryMs,
+    backpressureConfig: {
+      highWaterMark: config.sseBackpressureHighWaterMark,
+      criticalMark: config.sseBackpressureCriticalMark,
+      policy: BackpressurePolicy.DROP_NEWEST
+    },
+  });
+
+  // Redis subscriber for cross-instance fanout
+  if (redis && config.redisUrl) {
+    try {
+      sseSubscriber = new SSERedisSubscriber(
+        config.redisUrl,
+        sseManager,
+        config.redisKeyPrefix
+      );
+
+      await sseSubscriber.connect();
+
+      // Wire SSEManager callbacks → Redis subscriber
+      // When the first SSE client connects for an order → subscribe to Redis channel
+      // When the last SSE client disconnects → unsubscribe from Redis channel
+      sseManager.setConnectionHandlers(
+        (orderId) => { sseSubscriber!.subscribe(orderId); },
+        (orderId) => { sseSubscriber!.unsubscribe(orderId); }
+      );
+
+      logger.info('✅ SSE Redis subscriber connected (cross-instance fanout enabled)');
+    } catch (err) {
+      logger.warn(
+        { err },
+        '⚠️  SSE Redis subscriber failed — SSE works for in-process events only'
+      );
+      sseSubscriber = null;
+    }
+  } else {
+    logger.info('ℹ️  Redis not available — SSE cross-instance fanout disabled');
+  }
+
+  // Step 7: Build and start HTTP server
+  const app = await buildServer(pool, redis, sseManager);
 
   try {
     await app.listen({ port: config.port, host: config.host });
@@ -205,12 +278,12 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Step 7: Register graceful shutdown handlers
-  setupGracefulShutdown(app, pool, eventProducer, outboxRelay, leaderElection);
+  // Step 8: Register graceful shutdown handlers
+  setupGracefulShutdown(app, pool, eventProducer, outboxRelay, leaderElection, sseManager);
 
   // Log startup summary
   logger.info('─'.repeat(60));
-  logger.info('📦 Order Platform — Phase 4 (Distributed Coordination)');
+  logger.info('📦 Order Platform — Phase 5 (Realtime SSE + Backpressure)');
   logger.info(`   Environment:  ${config.nodeEnv}`);
   logger.info(`   Port:         ${config.port}`);
   logger.info(`   Kafka:        ${config.kafkaBrokers || 'NOT CONFIGURED'}`);
@@ -223,8 +296,10 @@ async function main(): Promise<void> {
   logger.info('   PATCH  /api/v1/orders/:id/status   — Update status (locked)');
   logger.info('   POST   /api/v1/orders/:id/cancel   — Cancel order');
   logger.info('   GET    /api/v1/orders/:id/history  — Status history');
-  logger.info('   POST   /api/v1/orders/:id/assign   — Assign driver (Phase 4)');
-  logger.info('   GET    /api/v1/orders/:id/assignment — Get assignment (Phase 4)');
+  logger.info('   GET    /api/v1/orders/:id/history  — Status history');
+  logger.info('   POST   /api/v1/orders/:id/assign   — Assign driver');
+  logger.info('   GET    /api/v1/orders/:id/assignment — Get assignment');
+  logger.info('   GET    /api/v1/orders/:id/stream   — SSE realtime stream (Phase 5)');
   logger.info('   GET    /health                     — Health check');
   logger.info('');
   if (redis) {
@@ -238,6 +313,14 @@ async function main(): Promise<void> {
     logger.info('   🚦 Rate limiting:   DISABLED');
     logger.info('   📦 Cache:           DISABLED');
     logger.info('   🔒 Distributed lock: DISABLED');
+  }
+  logger.info('');
+  // Phase 5: SSE status
+  if (sseManager) {
+    logger.info(`   📡 SSE:             ENABLED`);
+    logger.info(`   📡 Max connections: ${config.sseMaxTotalConnections}`);
+    logger.info(`   📡 Heartbeat:       ${config.sseHeartbeatIntervalMs}ms`);
+    logger.info(`   📡 Redis fanout:    ${sseSubscriber?.connected ? 'ACTIVE' : 'DISABLED'}`);
   }
   logger.info('');
   if (outboxRelay) {
